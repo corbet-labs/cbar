@@ -45,6 +45,7 @@ default = [
     "network_manager",
     "notifications",
     "script",
+    "system_graph",
     "sys_info",
     "tray",
     "volume",
@@ -117,6 +118,8 @@ network_manager = ["futures-lite", "zbus"]
 notifications = ["zbus"]
 
 script = []
+
+system_graph = []
 
 sys_info = ["dep:sysinfo"]
 

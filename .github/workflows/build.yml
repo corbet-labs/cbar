@@ -122,6 +122,7 @@ jobs:
           - notifications
           - sys_info
           - script
+          - system_graph
           - tray
           - volume
           - workspaces+all

@@ -1,0 +1,7 @@
+position = "top"
+
+[[center]]
+type = "system_graph"
+
+[center.network_actions]
+wlan = ["network-ui", "{category}", "{interface}"]
