@@ -597,6 +597,20 @@ struct SupervisorHandle {
     join_handle: tokio::task::JoinHandle<()>,
 }
 
+struct EventReaderTask(tokio::task::JoinHandle<()>);
+
+impl EventReaderTask {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for EventReaderTask {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 struct TaskState {
     supervisors: [Option<SupervisorHandle>; 3],
 }
@@ -793,7 +807,9 @@ async fn subscription_supervisor(
                 Ok(connection) => {
                     info!(?event_type, "Sway IPC subscription connected");
                     let (event_tx, events) = mpsc::channel(EVENT_QUEUE_CAPACITY);
-                    event_reader = Some(spawn(event_reader_loop(connection, event_type, event_tx)));
+                    event_reader = Some(EventReaderTask(spawn(event_reader_loop(
+                        connection, event_type, event_tx,
+                    ))));
                     event_rx = Some(events);
                     reconnect_retry = initial_retry;
 
@@ -936,7 +952,7 @@ fn dispatch_snapshot(listeners: &mut Vec<Listener>, snapshot: &Snapshot) {
 }
 
 fn stop_event_reader(
-    event_reader: &mut Option<tokio::task::JoinHandle<()>>,
+    event_reader: &mut Option<EventReaderTask>,
     event_rx: &mut Option<mpsc::Receiver<Result<Event>>>,
 ) {
     if let Some(reader) = event_reader.take() {
@@ -1445,6 +1461,63 @@ mod tests {
         request_task.await.expect("snapshot server should finish");
         subscription_task.abort();
         let _ = subscription_task.await;
+    }
+
+    #[tokio::test]
+    async fn dropping_client_aborts_active_event_reader_and_closes_socket() {
+        let (subscription_client, mut subscription_server) = duplex(8192);
+        let (request_client, mut request_server) = duplex(8192);
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let connector = queued_connector(
+            vec![
+                Ok(Connection::from_io(subscription_client)),
+                Ok(Connection::from_io(request_client)),
+            ],
+            connect_count.clone(),
+        );
+        let client = Client::with_connector(connector);
+
+        let subscription_task = tokio::spawn(async move {
+            acknowledge_subscription(&mut subscription_server, &["workspace"]).await;
+            let mut byte = [0_u8; 1];
+            subscription_server
+                .read_exact(&mut byte)
+                .await
+                .expect_err("dropping the client should close the active event socket");
+        });
+        let request_task = tokio::spawn(async move {
+            let request = read_frame(&mut request_server)
+                .await
+                .expect("workspace snapshot request should arrive");
+            assert_eq!(request.message_type, GET_WORKSPACES);
+            write_frame(&mut request_server, GET_WORKSPACES, b"[]")
+                .await
+                .expect("workspace snapshot should write");
+        });
+
+        let (messages_tx, mut messages_rx) = mpsc::unbounded_channel();
+        client
+            .add_workspace_listener(
+                || true,
+                move |message| messages_tx.send(message.clone()).is_ok(),
+            )
+            .await
+            .expect("workspace listener should register");
+        assert!(matches!(
+            timeout(Duration::from_secs(1), messages_rx.recv())
+                .await
+                .expect("snapshot timeout")
+                .expect("snapshot channel should stay open"),
+            WorkspaceMessage::Snapshot(workspaces) if workspaces.is_empty()
+        ));
+
+        drop(client);
+        timeout(Duration::from_secs(1), subscription_task)
+            .await
+            .expect("active event socket close timeout")
+            .expect("subscription server should finish");
+        request_task.await.expect("snapshot server should finish");
+        assert_eq!(connect_count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
