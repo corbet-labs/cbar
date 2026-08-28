@@ -417,7 +417,7 @@ impl Client {
 #[cfg(feature = "workspaces+hyprland")]
 impl super::WorkspaceClient for Client {
     fn focus(&self, target: WorkspaceTarget) {
-        let target = target.persistent_by_index();
+        let target = target.persistent_by_index(i64::from(i32::MAX));
         let res = if self.use_lua_dispatch {
             let workspace = match &target {
                 WorkspaceTarget::Id(id) => id.to_string(),
@@ -483,7 +483,22 @@ mod workspace_target_tests {
             name: "2".to_string(),
             index: Some(2),
         };
-        assert_eq!(target.persistent_by_index(), WorkspaceTarget::Id(2));
+        assert_eq!(
+            target.persistent_by_index(i64::from(i32::MAX)),
+            WorkspaceTarget::Id(2)
+        );
+    }
+
+    #[test]
+    fn out_of_range_persistent_favourite_preserves_exact_hyprland_name() {
+        let target = WorkspaceTarget::Persistent {
+            name: "2147483648".to_string(),
+            index: Some(i64::from(i32::MAX) + 1),
+        };
+        assert_eq!(
+            target.persistent_by_index(i64::from(i32::MAX)),
+            WorkspaceTarget::Name("2147483648".to_string())
+        );
     }
 }
 

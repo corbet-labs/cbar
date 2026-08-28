@@ -135,10 +135,10 @@ Scroll support belongs at the typed swayipc boundary. Horizontal and vertical
 layout aliases are accepted by the dependency's node-layout type. Cbar does not
 ship an IPC proxy or rewrite raw protocol messages.
 
-Favourite workspaces are native cbar state: a missing favourite can be created
-and focused by name, and an empty workspace event cannot silently remove its
-button. These behaviours have protocol-fixture tests and require no live
-compositor connection.
+Favourite workspaces are native cbar state: a missing favourite is addressed
+using the compositor's native name or numeric-index semantics, and an empty
+workspace event cannot silently remove its button. These behaviours have
+protocol-fixture tests and require no live compositor connection.
 
 ## Security boundary
 

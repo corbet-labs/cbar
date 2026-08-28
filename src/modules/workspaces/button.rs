@@ -46,10 +46,11 @@ impl WorkspaceBinding {
                     .favorite_name
                     .clone()
                     .expect("closed workspace button to be a favourite");
-                WorkspaceTarget::Persistent {
-                    index: name.parse().ok(),
-                    name,
-                }
+                let index = name
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|index| *index > 0 && index.to_string() == name);
+                WorkspaceTarget::Persistent { index, name }
             },
             WorkspaceTarget::Id,
         )
@@ -252,5 +253,18 @@ mod tests {
                 index: None,
             }
         );
+    }
+
+    #[test]
+    fn noncanonical_numeric_favourites_keep_their_exact_names() {
+        for name in ["02", "0", "-1", "+2", "9223372036854775808"] {
+            assert_eq!(
+                WorkspaceBinding::favorite(name).focus_target(),
+                WorkspaceTarget::Persistent {
+                    name: name.to_string(),
+                    index: None,
+                }
+            );
+        }
     }
 }

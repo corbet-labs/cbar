@@ -176,12 +176,12 @@ impl WorkspaceTarget {
         }
     }
 
-    pub(crate) fn persistent_by_index(&self) -> Self {
+    pub(crate) fn persistent_by_index(&self, max: i64) -> Self {
         match self {
             Self::Persistent {
                 index: Some(index), ..
-            } => Self::Id(*index),
-            Self::Persistent { name, index: None } => Self::Name(name.clone()),
+            } if *index > 0 && *index <= max => Self::Id(*index),
+            Self::Persistent { name, .. } => Self::Name(name.clone()),
             target => target.clone(),
         }
     }

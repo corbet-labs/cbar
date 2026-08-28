@@ -197,7 +197,7 @@ impl Client {
 
 impl WorkspaceClient for Client {
     fn focus(&self, target: WorkspaceTarget) {
-        let target = target.persistent_by_index();
+        let target = target.persistent_by_index(i64::MAX);
         debug!("focusing workspace: {target:?}");
 
         // this does annoyingly require spawning a separate connection for every focus call
@@ -245,6 +245,18 @@ mod workspace_target_tests {
             name: "2".to_string(),
             index: Some(2),
         };
-        assert_eq!(target.persistent_by_index(), WorkspaceTarget::Id(2));
+        assert_eq!(target.persistent_by_index(i64::MAX), WorkspaceTarget::Id(2));
+    }
+
+    #[test]
+    fn invalid_persistent_index_preserves_exact_niri_name() {
+        let target = WorkspaceTarget::Persistent {
+            name: "-1".to_string(),
+            index: Some(-1),
+        };
+        assert_eq!(
+            target.persistent_by_index(i64::MAX),
+            WorkspaceTarget::Name("-1".to_string())
+        );
     }
 }
