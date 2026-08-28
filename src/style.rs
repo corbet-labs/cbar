@@ -1,15 +1,10 @@
-use crate::channels::{AsyncSenderExt, MpscReceiverExt};
-use crate::spawn;
+use crate::channels::MpscReceiverExt;
+use crate::file_watch;
 use gtk::ffi::GTK_STYLE_PROVIDER_PRIORITY_USER;
 use gtk::{CssProvider, gio};
-use notify::event::ModifyKind;
-use notify::{Event, EventKind, RecursiveMode, Result, Watcher, recommended_watcher};
 use std::env;
 use std::path::PathBuf;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 #[derive(Debug)]
 pub enum CssSource {
@@ -56,38 +51,12 @@ pub fn load_css(source: &CssSource) {
 
     // install file watcher
     if let Some(style_path) = path {
-        let (tx, rx) = mpsc::channel(8);
+        let rx = file_watch::subscribe(&style_path).expect("Failed to start CSS file watcher");
+        debug!("Installed CSS file watcher on '{}'", style_path.display());
 
-        spawn(async move {
-            let style_path2 = style_path.clone();
-            let mut watcher = recommended_watcher(move |res: Result<Event>| match res {
-                Ok(event) if matches!(event.kind, EventKind::Modify(ModifyKind::Data(_))) => {
-                    debug!("{event:?}");
-                    if event.paths.first().is_some_and(|p| p == &style_path2) {
-                        tx.send_spawn(style_path2.clone());
-                    }
-                }
-                Err(e) => error!("Error occurred when watching stylesheet: {:?}", e),
-                _ => {}
-            })
-            .expect("Failed to create CSS file watcher");
-
-            let dir_path = style_path.parent().expect("to exist");
-
-            watcher
-                .watch(dir_path, RecursiveMode::NonRecursive)
-                .expect("Failed to start CSS file watcher");
-            debug!("Installed CSS file watcher on '{}'", style_path.display());
-
-            // avoid watcher from dropping
-            loop {
-                sleep(Duration::from_secs(1)).await;
-            }
-        });
-
-        rx.recv_glib((), move |(), path| {
+        rx.recv_glib((), move |(), ()| {
             info!("Reloading CSS");
-            provider.load_from_file(&gio::File::for_path(path));
+            provider.load_from_file(&gio::File::for_path(&style_path));
         });
     }
 }
