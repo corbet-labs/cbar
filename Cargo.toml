@@ -220,3 +220,9 @@ clap_complete = {  version = "4.6.5", optional = true }
 
 [build-dependencies]
 vergen-git2 = "9.1.0"
+
+[patch.crates-io]
+# Scroll uses the generic orientation names in otherwise sway-compatible node
+# events. Keep this at the typed IPC boundary until swayipc-types publishes the
+# upstream fix.
+swayipc-types = { git = "https://github.com/julian-corbet/swayipc-rs", rev = "055cc5eeb2e8c1530637dbc32b2c41e305ed7469" }

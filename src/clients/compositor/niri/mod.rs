@@ -1,5 +1,5 @@
 use super::Visibility;
-use super::{Workspace as IronWorkspace, WorkspaceClient, WorkspaceUpdate};
+use super::{Workspace as IronWorkspace, WorkspaceClient, WorkspaceTarget, WorkspaceUpdate};
 use crate::channels::SyncSenderExt;
 use crate::{arc_rw, read_lock, spawn, write_lock};
 use connection::{Action, Connection, Event, Request, WorkspaceReferenceArg};
@@ -196,17 +196,19 @@ impl Client {
 }
 
 impl WorkspaceClient for Client {
-    fn focus(&self, id: i64) {
-        debug!("focusing workspace with id: {}", id);
+    fn focus(&self, target: WorkspaceTarget) {
+        debug!("focusing workspace: {target:?}");
 
         // this does annoyingly require spawning a separate connection for every focus call
         // the alternative is sticking the conn behind a mutex which could perform worse
         spawn(async move {
             let mut conn = Connection::connect().await?;
 
-            let command = Request::Action(Action::FocusWorkspace {
-                reference: WorkspaceReferenceArg::Id(id as u64),
-            });
+            let reference = match target {
+                WorkspaceTarget::Id(id) => WorkspaceReferenceArg::Id(id as u64),
+                WorkspaceTarget::Name(name) => WorkspaceReferenceArg::Name(name),
+            };
+            let command = Request::Action(Action::FocusWorkspace { reference });
 
             if let Err(err) = conn.send(command).await {
                 error!("failed to send command: {err:?}");

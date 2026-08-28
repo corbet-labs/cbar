@@ -4,7 +4,7 @@ mod open_state;
 
 use self::button::Button;
 use crate::channels::{AsyncSenderExt, BroadcastReceiverExt};
-use crate::clients::compositor::{Workspace, WorkspaceClient, WorkspaceUpdate};
+use crate::clients::compositor::{Workspace, WorkspaceClient, WorkspaceTarget, WorkspaceUpdate};
 use crate::config::{CommonConfig, LayoutConfig, default};
 use crate::gtk_helpers::{IronbarGlibExt, IronbarGtkExt};
 use crate::modules::workspaces::button_map::{ButtonMap, Identifier};
@@ -205,7 +205,7 @@ pub struct WorkspaceItemContext {
     name_map: HashMap<String, String>,
     icon_size: i32,
     image_provider: image::Provider,
-    tx: mpsc::Sender<i64>,
+    tx: mpsc::Sender<WorkspaceTarget>,
     format_named: String,
     format_unnamed: String,
 }
@@ -277,7 +277,7 @@ fn reorder_workspaces(container: &gtk::Box, sort_order: SortOrder) {
 
 impl Module<gtk::Box> for WorkspacesModule {
     type SendMessage = WorkspaceUpdate;
-    type ReceiveMessage = i64;
+    type ReceiveMessage = WorkspaceTarget;
 
     module_impl!("workspaces");
 
@@ -307,8 +307,8 @@ impl Module<gtk::Box> for WorkspacesModule {
         spawn(async move {
             trace!("Setting up UI event handler");
 
-            while let Some(id) = rx.recv().await {
-                client.focus(id);
+            while let Some(target) = rx.recv().await {
+                client.focus(target);
             }
 
             Ok::<(), Report>(())
@@ -346,22 +346,14 @@ impl Module<gtk::Box> for WorkspacesModule {
         let favorites = Rc::new(favorites);
 
         for favorite in &*favorites {
-            // Ensure numbered favorites actually refer to their respective numbered workspaces
-            let (id, index) = match favorite.parse::<i64>() {
-                Ok(num) => (num, num),
+            let index = match favorite.parse::<i64>() {
+                Ok(num) => num,
                 Err(_err) => {
                     debug!("favorite name {favorite} failed to parse as i64");
-                    (-1, 0)
+                    0
                 }
             };
-            let btn = Button::new(
-                id,
-                index,
-                favorite,
-                info.output_name,
-                OpenState::Closed,
-                &item_context,
-            );
+            let btn = Button::new_favorite(index, favorite, info.output_name, &item_context);
 
             btn.button().set_tag("workspace_index", index);
             container.append(btn.button());
@@ -421,23 +413,15 @@ impl Module<gtk::Box> for WorkspacesModule {
 
             let remove_workspace = {
                 let container = container.clone();
-                let favorites = favorites.clone();
                 move |id: i64, button_map: &mut ButtonMap| {
-                    // Prevent what ends up effectively being permanently disabling favorite
-                    // workspace buttons
-                    if favorites.contains(&id.to_string()) {
-                        return;
-                    }
-                    // since other favourites use name identifiers,
-                    // we can safely remove using ID here and favourites will remain
+                    // Ordinary buttons are keyed by ID and disappear with their workspace.
                     if let Some(button) = button_map.remove(&Identifier::Id(id)) {
                         container.remove(button.button());
-                    } else {
-                        // otherwise we do a deep search and use the button's cached ID
-                        if let Some(button) = button_map.find_button_by_id_mut(id) {
-                            button.set_workspace_id(-1);
-                            button.set_open_state(OpenState::Closed);
-                        }
+                    // Favourites are keyed by name. Keep the button, detach the stale
+                    // compositor ID and restore its create-by-name click target.
+                    } else if let Some(button) = button_map.find_button_by_id_mut(id) {
+                        button.set_workspace_closed(id);
+                        button.set_open_state(OpenState::Closed);
                     }
                 }
             };
@@ -568,13 +552,13 @@ fn new_state_for_button(
     if button.open_state() == OpenState::Closed {
         None
     } else if button.monitor() == new.monitor {
-        if button.workspace_id() == new.id {
+        if button.workspace_id() == Some(new.id) {
             Some(OpenState::Focused)
         } else {
             Some(OpenState::Hidden)
         }
     } else if let Some(old) = old
-        && old.id == button.workspace_id()
+        && Some(old.id) == button.workspace_id()
     {
         if new.monitor == old.monitor {
             Some(OpenState::Hidden)

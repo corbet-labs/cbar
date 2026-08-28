@@ -7,24 +7,18 @@ use swayipc_async::{InputChange, InputEvent, Node, WorkspaceChange, WorkspaceEve
 use tokio::sync::broadcast::{Receiver, channel};
 
 #[cfg(feature = "workspaces")]
-use super::WorkspaceUpdate;
+use super::{WorkspaceTarget, WorkspaceUpdate};
 
 #[cfg(feature = "workspaces+sway")]
-impl super::WorkspaceClient for Client {
-    fn focus(&self, id: i64) {
-        let client = self.connection().clone();
-        spawn(async move {
-            let mut client = client.lock().await;
-
-            let workspace = client
-                .get_workspaces()
-                .await?
-                .into_iter()
-                .find(|w| w.id == id);
-
-            let Some(workspace) = workspace else {
-                return Err(Report::msg(format!("couldn't find workspace with id {id}")));
-            };
+fn focus_command_for_target(
+    target: &WorkspaceTarget,
+    workspace: Option<&swayipc_async::Workspace>,
+) -> Result<String, Report> {
+    match target {
+        WorkspaceTarget::Name(name) => Ok(format!("workspace {name}")),
+        WorkspaceTarget::Id(id) => {
+            let workspace = workspace
+                .ok_or_else(|| Report::msg(format!("couldn't find workspace with id {id}")))?;
 
             // Numbered workspaces are focused by number rather than name.
             // The name can be changed by another process (e.g. a
@@ -34,15 +28,37 @@ impl super::WorkspaceClient for Client {
             // empty workspace instead of focusing the existing one. The
             // number is stable across such renames, so prefer it when
             // available; sway reports -1 for workspaces with no number.
-            let command = if workspace.num >= 0 {
-                format!("workspace number {}", workspace.num)
+            if workspace.num >= 0 {
+                Ok(format!("workspace number {}", workspace.num))
             } else {
-                format!("workspace {}", workspace.name)
+                Ok(format!("workspace {}", workspace.name))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "workspaces+sway")]
+impl super::WorkspaceClient for Client {
+    fn focus(&self, target: WorkspaceTarget) {
+        let client = self.connection().clone();
+        spawn(async move {
+            let mut client = client.lock().await;
+
+            let workspace = if let WorkspaceTarget::Id(id) = &target {
+                client
+                    .get_workspaces()
+                    .await?
+                    .into_iter()
+                    .find(|workspace| workspace.id == *id)
+            } else {
+                None
             };
+
+            let command = focus_command_for_target(&target, workspace.as_ref())?;
 
             if let Err(e) = client.run_command(command).await {
                 return Err(Report::msg(format!(
-                    "Couldn't focus workspace '{id}': {e:#}"
+                    "Couldn't focus workspace '{target:?}': {e:#}"
                 )));
             }
 
@@ -170,6 +186,35 @@ impl From<WorkspaceEvent> for WorkspaceUpdate {
             }
             _ => Self::Unknown,
         }
+    }
+}
+
+#[cfg(all(test, feature = "workspaces+sway"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scroll_node_layout_orientation_aliases_deserialize() {
+        assert_eq!(
+            serde_json::from_str::<swayipc_async::NodeLayout>(r#""horizontal""#)
+                .expect("horizontal layout to deserialize"),
+            swayipc_async::NodeLayout::SplitH
+        );
+        assert_eq!(
+            serde_json::from_str::<swayipc_async::NodeLayout>(r#""vertical""#)
+                .expect("vertical layout to deserialize"),
+            swayipc_async::NodeLayout::SplitV
+        );
+    }
+
+    #[test]
+    fn closed_numbered_favourite_focuses_by_name() {
+        let target = WorkspaceTarget::Name("2".to_string());
+
+        assert_eq!(
+            focus_command_for_target(&target, None).expect("named target to produce a command"),
+            "workspace 2"
+        );
     }
 }
 

@@ -154,6 +154,17 @@ pub struct Workspace {
     pub visibility: Visibility,
 }
 
+/// Identifies a workspace to focus.
+///
+/// Open workspaces use their compositor-assigned ID. Persistent favourites
+/// use their configured name while closed so the compositor can create them.
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[cfg(feature = "workspaces")]
+pub enum WorkspaceTarget {
+    Id(i64),
+    Name(String),
+}
+
 /// Indicates workspace visibility.
 /// Visible workspaces have a boolean flag to indicate if they are also focused.
 #[derive(Debug, Copy, Clone)]
@@ -232,8 +243,8 @@ pub struct BindModeUpdate {
 
 #[cfg(feature = "workspaces")]
 pub trait WorkspaceClient: Debug + Send + Sync {
-    /// Requests the workspace with this id is focused.
-    fn focus(&self, id: i64);
+    /// Requests the identified workspace is focused or created.
+    fn focus(&self, target: WorkspaceTarget);
 
     /// Creates a new to workspace event receiver.
     fn subscribe(&self) -> broadcast::Receiver<WorkspaceUpdate>;

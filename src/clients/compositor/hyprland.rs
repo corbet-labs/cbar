@@ -22,7 +22,7 @@ use tokio::sync::broadcast::{Receiver, Sender, channel};
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "workspaces")]
-use super::WorkspaceUpdate;
+use super::{WorkspaceTarget, WorkspaceUpdate};
 
 #[derive(Debug)]
 struct TxRx<T> {
@@ -416,17 +416,24 @@ impl Client {
 
 #[cfg(feature = "workspaces+hyprland")]
 impl super::WorkspaceClient for Client {
-    fn focus(&self, id: i64) {
+    fn focus(&self, target: WorkspaceTarget) {
         let res = if self.use_lua_dispatch {
-            let arg = format!("{{workspace=\"{id}\"}}");
+            let workspace = match &target {
+                WorkspaceTarget::Id(id) => id.to_string(),
+                WorkspaceTarget::Name(name) => name.replace('\\', "\\\\").replace('"', "\\\""),
+            };
+            let arg = format!("{{workspace=\"{workspace}\"}}");
             Dispatch::call(DispatchType::Custom("hl.dsp.focus", &arg))
         } else {
-            let identifier = WorkspaceIdentifierWithSpecial::Id(id as i32);
+            let identifier = match &target {
+                WorkspaceTarget::Id(id) => WorkspaceIdentifierWithSpecial::Id(*id as i32),
+                WorkspaceTarget::Name(name) => WorkspaceIdentifierWithSpecial::Name(name),
+            };
             Dispatch::call(DispatchType::Workspace(identifier))
         };
 
         if let Err(e) = res {
-            error!("Couldn't focus workspace '{id}': {e:#}");
+            error!("Couldn't focus workspace '{target:?}': {e:#}");
         }
     }
 
