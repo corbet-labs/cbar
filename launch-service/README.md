@@ -32,6 +32,13 @@ reported before another process is spawned. Linux child exits normally wake
 the single reaper through pidfds; a two-second scan is only the compatibility
 path for older kernels and other operating systems.
 
+A direct child is placed in its own process group and survives an ordinary
+parent exit on POSIX, but it necessarily inherits the caller's existing cgroup,
+resource limits and sandbox. Only the user-service backend provides a new
+service lifetime and policy boundary. Linux packages that promise that boundary
+must ship a working user manager and `systemd-run`; the direct backend remains
+the bounded portability path for systems without one.
+
 The manager backend copies every representable variable present in the
 caller's environment and preserves the caller's working directory. A systemd
 user manager can additionally supply its own baseline and service metadata

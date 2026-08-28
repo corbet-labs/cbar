@@ -68,9 +68,17 @@ Provider failures are local. A failed graph source, remote machine or
 compositor subscription must not terminate the panel or stall unrelated
 providers. Tasks are supervised and restarted with bounded exponential backoff.
 
-Launched applications are not children whose lifetime or sandbox is inherited
-from cbar. The launcher hands them to a transient user service so restarting or
-hardening cbar cannot terminate or accidentally restrict applications.
+On Linux with an available user service manager, the launcher hands applications
+to collected transient services. Those applications do not inherit cbar's
+lifetime or service sandbox, so restarting or hardening cbar does not terminate
+or accidentally restrict them.
+
+The portable backend used when no service manager is available owns direct
+children in one bounded reaper. They survive an ordinary parent exit on POSIX,
+but process APIs cannot move them out of a cgroup or sandbox already inherited
+from cbar. Packaged Linux sessions therefore treat the transient-service backend
+as the isolation contract; the direct backend is an explicit portability path,
+not an equivalent sandbox boundary.
 
 ## Offline-first launcher
 
