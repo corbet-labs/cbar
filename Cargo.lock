@@ -123,46 +123,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-io"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43a2b323ccce0a1d90b449fd71f2a06ca7faa7c54c2751f06c9bd851fc061059"
-dependencies = [
- "async-lock",
- "cfg-if",
- "concurrent-queue",
- "futures-io",
- "futures-lite",
- "parking",
- "polling",
- "rustix 0.38.44",
- "slab",
- "tracing",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "async-lock"
-version = "3.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff6e472cdea888a4bd64f342f09b3f50e1886d32afe8df3d663c01140b811b18"
-dependencies = [
- "event-listener",
- "event-listener-strategy",
- "pin-project-lite",
-]
-
-[[package]]
-name = "async-pidfd"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "958321a23896f573a3f1809437af5816f3bc90dd2d5ffe8b1cd5645f42230c17"
-dependencies = [
- "async-io",
- "libc",
-]
-
-[[package]]
 name = "async-recursion"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1965,7 +1925,6 @@ dependencies = [
  "serde_json",
  "smithay-client-toolkit",
  "strip-ansi-escapes",
- "swayipc-async",
  "sysinfo",
  "system-tray",
  "thiserror 2.0.20",
@@ -3399,30 +3358,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "swayipc-async"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "806f344927009a79deb17bcf103abdc93492254165f651df2bb64e0d6b4bda67"
-dependencies = [
- "async-io",
- "async-pidfd",
- "futures-lite",
- "serde",
- "serde_json",
- "swayipc-types",
-]
-
-[[package]]
-name = "swayipc-types"
-version = "2.0.1"
-source = "git+https://github.com/julian-corbet/swayipc-rs?rev=055cc5eeb2e8c1530637dbc32b2c41e305ed7469#055cc5eeb2e8c1530637dbc32b2c41e305ed7469"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.20",
-]
 
 [[package]]
 name = "symlink"

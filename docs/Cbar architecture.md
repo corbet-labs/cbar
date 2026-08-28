@@ -47,7 +47,8 @@ The first release owns:
 - the GTK layer-shell panel;
 - the application launcher;
 - native system and network graphs;
-- typed compositor integration, including Scroll's layout aliases; and
+- typed compositor integration, including Scroll-compatible workspace events;
+  and
 - a local control socket for reveal, hide and other panel actions.
 
 The compositor, notification daemon, OSD and lock screen remain separate
@@ -150,9 +151,13 @@ must not regress; a missing adapter disables only the capability it provides.
 GTK/GDK and standard Wayland protocols are preferred where they express the
 required operation.
 
-Scroll support belongs at the typed swayipc boundary. Horizontal and vertical
-layout aliases are accepted by the dependency's node-layout type. Cbar does not
-ship an IPC proxy or rewrite raw protocol messages.
+Each compositor stays behind the common typed adapter. For Sway/i3 protocol
+backends, cbar owns a small, self-contained implementation of the bounded wire
+framing. It deserializes only the workspace, input and mode fields the panel
+consumes; unrelated recursive node fields and layout spellings are ignored, so
+compatible compositors can extend their event payloads without breaking the
+panel. Cbar does not ship an IPC proxy, rewrite raw protocol messages or depend
+on a private compositor-protocol patch.
 
 Favourite workspaces are native cbar state: a missing favourite is addressed
 using the compositor's native name or numeric-index semantics, and an empty
