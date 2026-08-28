@@ -15,7 +15,7 @@ use crate::modules::{Module, ModuleInfo, ModuleParts, WidgetContext};
 use crate::{module_impl, spawn};
 use area::ResponsiveGraphArea;
 use gtk::DrawingArea;
-use gtk::gdk::BUTTON_PRIMARY;
+use gtk::gdk::{BUTTON_PRIMARY, BUTTON_SECONDARY};
 use gtk::prelude::*;
 use gtk::{GestureClick, Tooltip};
 use hub::{GraphDemand, GraphHub};
@@ -73,10 +73,14 @@ fn default_demand() -> Arc<GraphDemand> {
 /// Vertical bars leave this optional module hidden rather than forcing its
 /// horizontal history into the bar's cross-axis.
 pub struct SystemGraphModule {
-    /// Optional category-specific click actions. Each value is an argument
-    /// vector, never a shell string. Exact `{category}` and `{interface}`
-    /// arguments are replaced at launch time.
+    /// Optional category-specific primary-click actions. Each value is an
+    /// argument vector, never a shell string. Exact `{category}` and
+    /// `{interface}` arguments are replaced at launch time.
     network_actions: NetworkActions,
+
+    /// Optional category-specific secondary-click actions, with the same
+    /// exact argument-vector contract as `network_actions`.
+    network_secondary_actions: NetworkActions,
 
     /// See [common options](module-level-options#common-options).
     pub common: Option<CommonConfig>,
@@ -90,6 +94,7 @@ impl Default for SystemGraphModule {
     fn default() -> Self {
         Self {
             network_actions: NetworkActions::default(),
+            network_secondary_actions: NetworkActions::default(),
             common: Some(CommonConfig::default()),
             demand: default_demand(),
         }
@@ -103,6 +108,7 @@ impl Clone for SystemGraphModule {
         // output's allocation or unmap overwrite another output's demand.
         Self {
             network_actions: self.network_actions.clone(),
+            network_secondary_actions: self.network_secondary_actions.clone(),
             common: self.common.clone(),
             demand: default_demand(),
         }
@@ -124,7 +130,7 @@ impl Module<gtk::Box> for SystemGraphModule {
         if info.bar_position.orientation() != gtk::Orientation::Horizontal {
             return Ok(());
         }
-        if !self.network_actions.is_empty() {
+        if !self.network_actions.is_empty() || !self.network_secondary_actions.is_empty() {
             warm_launch_service();
         }
         let hub = GraphHub::global();
@@ -211,9 +217,22 @@ impl Module<gtk::Box> for SystemGraphModule {
         container.append(&area);
 
         let drawing_area: &DrawingArea = area.upcast_ref();
-        install_network_tooltips(drawing_area, &frame, &self.network_actions);
+        install_network_tooltips(
+            drawing_area,
+            &frame,
+            &self.network_actions,
+            &self.network_secondary_actions,
+        );
         if !self.network_actions.is_empty() {
-            install_network_actions(drawing_area, &frame, self.network_actions);
+            install_network_actions(drawing_area, &frame, self.network_actions, BUTTON_PRIMARY);
+        }
+        if !self.network_secondary_actions.is_empty() {
+            install_network_actions(
+                drawing_area,
+                &frame,
+                self.network_secondary_actions,
+                BUTTON_SECONDARY,
+            );
         }
 
         subscribe_canvas(&area, &frame, cancel_rx);
@@ -307,11 +326,13 @@ fn network_at_x(frame: &GraphFrame, width: i32, x: f64) -> Option<(Metric, &mode
 fn install_network_tooltips(
     area: &DrawingArea,
     frame: &Rc<RefCell<Arc<GraphFrame>>>,
-    actions: &NetworkActions,
+    primary_actions: &NetworkActions,
+    secondary_actions: &NetworkActions,
 ) {
     area.set_has_tooltip(true);
     let frame = frame.clone();
-    let actions = actions.clone();
+    let primary_actions = primary_actions.clone();
+    let secondary_actions = secondary_actions.clone();
     area.connect_query_tooltip(move |area, x, _y, keyboard, tooltip| {
         if keyboard {
             return false;
@@ -324,7 +345,7 @@ fn install_network_tooltips(
             tooltip,
             metric,
             &view.current,
-            actions.get(metric).is_some(),
+            primary_actions.get(metric).is_some() || secondary_actions.get(metric).is_some(),
         );
         true
     });
@@ -334,8 +355,9 @@ fn install_network_actions(
     area: &DrawingArea,
     frame: &Rc<RefCell<Arc<GraphFrame>>>,
     actions: NetworkActions,
+    button: u32,
 ) {
-    let click = GestureClick::builder().button(BUTTON_PRIMARY).build();
+    let click = GestureClick::builder().button(button).build();
     let frame = frame.clone();
     let area_for_click = area.downgrade();
     click.connect_released(move |_, _, x, _| {
@@ -481,6 +503,10 @@ mod interaction_tests {
                     .as_slice()
             )
         );
+        assert_eq!(
+            module.network_secondary_actions.get(Metric::Wlan),
+            Some(["network-editor"].map(str::to_string).as_slice())
+        );
     }
 
     #[test]
@@ -508,6 +534,31 @@ mod interaction_tests {
         assert_eq!(prepared.0, "network-ui");
         assert_eq!(prepared.1, ["wlan", "radio;still-one-argument"]);
         assert!(prepare_network_action(&[String::new()], Metric::Wlan, "radio").is_none());
+    }
+
+    #[test]
+    fn primary_and_secondary_network_actions_are_independently_optional() {
+        let module = SystemGraphModule {
+            network_actions: NetworkActions {
+                wlan: Some(vec!["radio-menu".to_string()]),
+                ..NetworkActions::default()
+            },
+            network_secondary_actions: NetworkActions {
+                wlan: Some(vec!["connection-editor".to_string()]),
+                ..NetworkActions::default()
+            },
+            ..SystemGraphModule::default()
+        };
+
+        assert_eq!(
+            module.network_actions.get(Metric::Wlan),
+            Some(["radio-menu".to_string()].as_slice())
+        );
+        assert_eq!(
+            module.network_secondary_actions.get(Metric::Wlan),
+            Some(["connection-editor".to_string()].as_slice())
+        );
+        assert!(module.network_secondary_actions.get(Metric::Lan).is_none());
     }
 
     #[test]

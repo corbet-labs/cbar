@@ -6,3 +6,6 @@ center:
         - network-ui
         - "{category}"
         - "{interface}"
+    network_secondary_actions:
+      wlan:
+        - network-editor

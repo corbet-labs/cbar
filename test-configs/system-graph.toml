@@ -5,3 +5,6 @@ type = "system_graph"
 
 [center.network_actions]
 wlan = ["network-ui", "{category}", "{interface}"]
+
+[center.network_secondary_actions]
+wlan = ["network-editor"]
