@@ -1001,8 +1001,10 @@ impl LauncherUi {
 /// when the backend hands them over separately; on wlroots compositors both come back as the
 /// literal string `Unknown` and the entire identity arrives in the DESCRIPTION instead:
 ///
-///     connector "DP-1"   manufacturer "Unknown"   model "Unknown"
-///     description "Dell Inc. DELL U4323QE DPMH1P3 (DP-1)"
+/// ```text
+/// connector "DP-1"   manufacturer "Unknown"   model "Unknown"
+/// description "Dell Inc. DELL U4323QE DPMH1P3 (DP-1)"
+/// ```
 ///
 /// A configured `DELL U4323QE` has to find that. Exact-matching a field that also carries the
 /// vendor, the serial and the connector could only ever fail, and failing here is quiet -- it
