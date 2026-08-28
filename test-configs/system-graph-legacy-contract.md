@@ -10,6 +10,8 @@ port. It is provenance, not a second runtime implementation.
 - canvas height: 26 px
 - CPU/RAM content canvas: 220 px, split into 99.5 px series around a
   1 px divider with 10 px on each side
+- CPU/RAM divider origin in the bar canvas: 120.5 px = 11 px outer inset +
+  99.5 px CPU series + 10 px internal pad
 - optional content canvas: 84 px
 - module inset: 11 px per side; adjacent cell gutter: 22 px
 - labels: CPU, RAM, SWAP, IO, VPU, GPU, NPU, LAN, WLAN, WWAN, VPN

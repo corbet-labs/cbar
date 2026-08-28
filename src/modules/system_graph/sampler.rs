@@ -416,6 +416,7 @@ impl Sampler {
         }
 
         self.sample_network(now_ns, &sources.interfaces, demand);
+        self.seed_available_scalar_views();
         self.frame.capabilities = self.capabilities();
         self.frame.clone()
     }
@@ -503,6 +504,21 @@ impl Sampler {
 
     fn add_capability(&mut self, metric: Metric, provider: Provider, instances: usize) {
         self.capabilities.insert((metric, provider), instances);
+    }
+
+    fn seed_available_scalar_views(&mut self) {
+        let missing: Vec<_> = self
+            .frame
+            .available
+            .iter()
+            .filter(|metric| !metric.is_network() && !self.frame.scalar.contains_key(metric))
+            .collect();
+        for metric in missing {
+            // Delta providers need one counter baseline before they can report
+            // a rate. Availability must never reserve an entirely blank cell;
+            // publish a deterministic zero view until the first delta arrives.
+            self.frame.push_scalar(metric, 0.0, self.history_len);
+        }
     }
 
     fn ensure_drm_open_monitor(&mut self) {
@@ -1133,6 +1149,96 @@ fn default_route_interfaces(proc_root: &Path) -> HashSet<String> {
     interfaces
 }
 
+fn virtual_lan_has_physical_backing(path: &Path) -> bool {
+    let Some(net_root) = path.parent() else {
+        return false;
+    };
+    let mut pending = vec![path.to_path_buf()];
+    let mut visited = HashSet::new();
+    while let Some(candidate) = pending.pop() {
+        let Some(name) = candidate
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        if !visited.insert(name) {
+            continue;
+        }
+        if is_physical_wired_interface(&candidate) {
+            return true;
+        }
+        pending.extend(
+            linked_lower_interfaces(&candidate)
+                .into_iter()
+                .map(|lower| net_root.join(lower))
+                .filter(|lower| lower.exists()),
+        );
+    }
+    false
+}
+
+fn linked_lower_interfaces(path: &Path) -> HashSet<String> {
+    let mut lowers = HashSet::new();
+    if let Ok(entries) = fs::read_dir(path.join("brif")) {
+        lowers.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned()),
+        );
+    }
+    if let Ok(slaves) = fs::read_to_string(path.join("bonding/slaves")) {
+        lowers.extend(slaves.split_whitespace().map(str::to_string));
+    }
+    if let Ok(entries) = fs::read_dir(path) {
+        lowers.extend(entries.filter_map(Result::ok).filter_map(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .strip_prefix("lower_")
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        }));
+    }
+    lowers
+}
+
+fn has_lower_interface_entry(path: &Path) -> bool {
+    fs::read_dir(path).is_ok_and(|mut entries| {
+        entries.any(|entry| {
+            entry.is_ok_and(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .strip_prefix("lower_")
+                    .is_some_and(|name| !name.is_empty())
+            })
+        })
+    })
+}
+
+fn is_physical_wired_interface(path: &Path) -> bool {
+    if !path.join("device").exists()
+        || fs::read_to_string(path.join("type"))
+            .ok()
+            .is_none_or(|link_type| link_type.trim() != "1")
+        || path.join("wireless").exists()
+        || path.join("qmi/raw_ip").exists()
+        || path.join("wwan").exists()
+        || path.join("bridge").exists()
+        || path.join("bonding").exists()
+    {
+        return false;
+    }
+    let uevent = fs::read_to_string(path.join("uevent")).unwrap_or_default();
+    !uevent.lines().any(|line| {
+        matches!(
+            line.strip_prefix("DEVTYPE="),
+            Some("wlan" | "wwan" | "bridge" | "bond" | "vlan")
+        )
+    })
+}
+
 fn classify_network(path: PathBuf, primary_routes: &HashSet<String>) -> Option<NetworkInterface> {
     let name = path.file_name()?.to_string_lossy().into_owned();
     if name == "lo" {
@@ -1143,6 +1249,10 @@ fn classify_network(path: PathBuf, primary_routes: &HashSet<String>) -> Option<N
         .lines()
         .find_map(|line| line.strip_prefix("DEVTYPE="));
     let link_type = fs::read_to_string(path.join("type")).unwrap_or_default();
+    let virtual_lan = matches!(devtype, Some("bridge" | "bond" | "vlan"))
+        || path.join("bridge").exists()
+        || path.join("bonding").exists()
+        || has_lower_interface_entry(&path);
     let metric = match () {
         // Positive WWAN topology must precede ARPHRD_NONE: qmi_wwan raw-IP
         // links use that same link type as WireGuard/TUN.
@@ -1158,15 +1268,14 @@ fn classify_network(path: PathBuf, primary_routes: &HashSet<String>) -> Option<N
         _ if matches!(devtype, Some("wireguard" | "tun")) || path.join("tun_flags").exists() => {
             Metric::Vpn
         }
-        _ if matches!(devtype, Some("bridge" | "bond"))
-            || path.join("bridge").exists()
-            || path.join("bonding").exists() =>
+        _ if virtual_lan
+            && (primary_routes.contains(&name) || virtual_lan_has_physical_backing(&path)) =>
         {
             Metric::Lan
         }
-        // VLANs are virtual Ethernet links but have an explicit kernel
-        // topology type. Keep generic virtual type-1 links excluded.
-        _ if devtype == Some("vlan") => Metric::Lan,
+        // Do not rotate container/libvirt-only bridges through the primary
+        // wired graph merely because their kernel topology is bridge-shaped.
+        _ if virtual_lan => return None,
         _ if link_type.trim() == "1"
             && (path.join("device").exists() || primary_routes.contains(&name)) =>
         {
@@ -1490,6 +1599,24 @@ mod tests {
         let frame = sampler.sample(Duration::from_secs(1), demand);
         assert_eq!(frame.scalar[&Metric::Ram].current(), Some(60.0));
         assert_eq!(frame.scalar[&Metric::Swap].current(), Some(20.0));
+    }
+
+    #[test]
+    fn available_delta_scalars_publish_zero_on_their_baseline_frame() {
+        let fixture = Fixture::new();
+        basic_proc(&fixture);
+        fixture.write("proc/diskstats", "8 0 sda 0 0 0 0 0 0 0 0 0 100 0 0\n");
+        fs::create_dir_all(fixture.root.join("sys/block/sda"))
+            .expect("whole block fixture should be created");
+        fixture.write("sys/class/accel/accel7/device/npu_busy_time_us", "100\n");
+
+        let mut sampler = Sampler::new(fixture.roots.clone(), 4, 30);
+        let demand: MetricSet = [Metric::Cpu, Metric::Io, Metric::Npu].into_iter().collect();
+        let frame = sampler.sample(Duration::from_secs(1), demand);
+        for metric in [Metric::Cpu, Metric::Io, Metric::Npu] {
+            assert!(frame.available.contains(metric));
+            assert_eq!(frame.scalar[&metric].values().collect::<Vec<_>>(), [0.0]);
+        }
     }
 
     #[test]
@@ -1964,6 +2091,10 @@ mod tests {
             ("epsilon", "1", false),
             ("zeta", "65534", false),
             ("theta", "1", false),
+            ("kappa", "1", true),
+            ("iota", "1", false),
+            ("lambda", "1", false),
+            ("mu", "1", false),
         ] {
             fixture.network(NetworkFixture {
                 name,
@@ -1990,13 +2121,28 @@ mod tests {
             .expect("WLAN topology directory should be created");
         fs::create_dir_all(fixture.root.join("sys/class/net/beta/bridge"))
             .expect("bridge topology directory should be created");
+        fs::create_dir_all(fixture.root.join("sys/class/net/beta/brif/gamma"))
+            .expect("bridge-to-bond topology should be created");
         fs::create_dir_all(fixture.root.join("sys/class/net/gamma/bonding"))
             .expect("bond topology directory should be created");
+        fixture.write("sys/class/net/gamma/bonding/slaves", "kappa\n");
+        fs::create_dir_all(fixture.root.join("sys/class/net/eta/lower_gamma"))
+            .expect("VLAN-to-bond lower-link topology should be created");
+        fs::create_dir_all(fixture.root.join("sys/class/net/lambda/bridge"))
+            .expect("internal bridge topology directory should be created");
+        fs::create_dir_all(fixture.root.join("sys/class/net/lambda/brif/iota"))
+            .expect("internal virtual bridge slave should be created");
+        fs::create_dir_all(fixture.root.join("sys/class/net/iota/bridge"))
+            .expect("cyclic internal bridge topology directory should be created");
+        fs::create_dir_all(fixture.root.join("sys/class/net/iota/brif/lambda"))
+            .expect("virtual topology cycle should be created");
+        fs::create_dir_all(fixture.root.join("sys/class/net/mu/bridge"))
+            .expect("default-route bridge topology should be created");
         fixture.write("sys/class/net/delta/qmi/raw_ip", "Y\n");
         fixture.write("sys/class/net/epsilon/tun_flags", "1001\n");
         fixture.write(
             "proc/net/route",
-            "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\ntheta 00000000 00000000 0003 0 0 100 00000000 0 0 0\n",
+            "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\ntheta 00000000 00000000 0003 0 0 100 00000000 0 0 0\nmu 00000000 00000000 0003 0 0 200 00000000 0 0 0\n",
         );
 
         let sampler = Sampler::new(fixture.roots.clone(), 4, 30);
@@ -2013,6 +2159,10 @@ mod tests {
         assert_eq!(classes.get("zeta"), Some(&Metric::Vpn));
         assert_eq!(classes.get("theta"), Some(&Metric::Lan));
         assert_eq!(classes.get("eta"), Some(&Metric::Lan));
+        assert_eq!(classes.get("kappa"), Some(&Metric::Lan));
+        assert_eq!(classes.get("mu"), Some(&Metric::Lan));
+        assert!(!classes.contains_key("iota"));
+        assert!(!classes.contains_key("lambda"));
     }
 
     #[test]
@@ -2039,6 +2189,8 @@ mod tests {
             tx: 7_000,
             physical: true,
         });
+        fs::create_dir_all(fixture.root.join("sys/class/net/br0/brif/enp1s0"))
+            .expect("primary bridge should expose its physical slave topology");
         fixture.network(NetworkFixture {
             name: "wlan-é",
             devtype: "wlan",

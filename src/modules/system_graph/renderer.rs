@@ -2,6 +2,7 @@ use super::model::{Cell, GraphFrame, History, Layout, Metric, NetworkHistory};
 use gtk::cairo::{Context, Error, FontSlant, FontWeight};
 
 const DIVIDER_HEIGHT: f64 = 22.0;
+const DIVIDER_WIDTH: f64 = 1.0;
 const MIN_HISTORY_WIDTH: f64 = 10.0;
 
 pub fn draw(
@@ -47,11 +48,32 @@ fn draw_divider(
     current: Cell,
     height: f64,
 ) -> Result<(), Error> {
-    let gap_start = previous.x + previous.width;
-    let x = gap_start + (current.x - gap_start) / 2.0;
+    let x = divider_x(previous, current);
     context.set_source_rgba(1.0, 1.0, 1.0, 0.22);
-    context.rectangle(x, (height - DIVIDER_HEIGHT) / 2.0, 1.0, DIVIDER_HEIGHT);
+    context.rectangle(
+        x,
+        (height - DIVIDER_HEIGHT) / 2.0,
+        DIVIDER_WIDTH,
+        DIVIDER_HEIGHT,
+    );
     context.fill()
+}
+
+fn divider_x(previous: Cell, current: Cell) -> f64 {
+    let gap_start = previous.x + previous.width;
+    let gap = current.x - gap_start;
+    if matches!(
+        (previous.metric, current.metric),
+        (Metric::Cpu, Metric::Ram)
+    ) {
+        // The deployed Lua pair places a one-pixel rule after its 99.5px CPU
+        // series and 10px pad. Account for the rule width itself instead of
+        // centring its left edge: global x = 11 + 99.5 + 10 = 120.5px.
+        gap_start + (gap - DIVIDER_WIDTH) / 2.0
+    } else {
+        // Optional cells retain their recorded 11/11 midpoint contract.
+        gap_start + gap / 2.0
+    }
 }
 
 fn draw_scalar(context: &Context, cell: Cell, height: f64, history: &History) -> Result<(), Error> {
@@ -327,6 +349,16 @@ mod tests {
         assert_eq!(format_rate(1_500_000_000.0), "1.5G");
     }
 
+    #[test]
+    fn divider_origins_match_the_recorded_legacy_canvas() {
+        let layout = Layout::fit(MetricSet::all(), 1196);
+        assert_eq!(divider_x(layout.cells[0], layout.cells[1]), 120.5);
+        assert_eq!(divider_x(layout.cells[1], layout.cells[2]), 242.0);
+
+        let centered = Layout::fit(MetricSet::all(), 1396);
+        assert_eq!(divider_x(centered.cells[0], centered.cells[1]), 220.5);
+    }
+
     fn reference_frame() -> GraphFrame {
         let mut frame = GraphFrame {
             available: MetricSet::all(),
@@ -458,9 +490,9 @@ mod tests {
         assert_eq!(
             reference_hashes,
             [
-                873_603_440_895_753_312,
-                9_721_719_113_787_573_938,
-                9_024_144_837_045_430_680,
+                14_419_014_071_079_099_776,
+                4_915_036_840_708_691_194,
+                8_217_295_459_609_970_648,
             ]
         );
         #[cfg(not(target_endian = "little"))]
@@ -473,20 +505,20 @@ mod tests {
         assert_eq!(workload.scalar[&Metric::Ram].current(), Some(60.0));
         assert_eq!(
             workload.scalar[&Metric::Gpu].values().collect::<Vec<_>>(),
-            [20.0, 0.0]
+            [0.0, 20.0, 0.0]
         );
         assert_eq!(
             workload.scalar[&Metric::Vpu].values().collect::<Vec<_>>(),
-            [50.0, 0.0]
+            [0.0, 50.0, 0.0]
         );
         assert_eq!(
             workload.scalar[&Metric::Npu].values().collect::<Vec<_>>(),
-            [50.0, 50.0, 0.0]
+            [0.0, 50.0, 50.0, 0.0]
         );
         assert_eq!((discovery_scans, sample_scans), (2, 2));
         let workload_hash = render_hash(&workload, 440, &font);
         #[cfg(target_endian = "little")]
-        assert_eq!(workload_hash, 10_776_692_565_452_878_033);
+        assert_eq!(workload_hash, 2_327_421_445_038_321_209);
         assert_eq!(workload_hash, render_hash(&workload, 440, &font));
         let labels_only = GraphFrame {
             available: workload.available,

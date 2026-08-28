@@ -465,6 +465,7 @@ mod tests {
         assert!(
             provenance.contains("4910626be2eb4d27f13450c6bcba860da8f6d6a3c766d3ffe520ba22cd58f715")
         );
+        assert!(provenance.contains("120.5 px"));
         let layout = Layout::fit(MetricSet::all(), 1196);
         assert_eq!(
             geometry_snapshot(&layout),
