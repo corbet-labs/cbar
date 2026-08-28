@@ -149,10 +149,12 @@ protocol-fixture tests and require no live compositor connection.
 
 ## Security boundary
 
-The local control socket is created with user-only permissions and verifies the
-peer user. Persistent launcher state is atomic, mode `0600`, size bounded and
-opened without following symlinks. Desktop entries become argument vectors;
-they are never interpolated into a shell command.
+The local control socket is created with user-only permissions, verifies the
+peer user, and is disabled unless `XDG_RUNTIME_DIR` is a real, user-owned
+directory with no group or other access. Persistent launcher state is atomic,
+mode `0600`, size bounded and opened without following symlinks. Desktop
+entries become argument vectors; they are never interpolated into a shell
+command.
 
 Ironbar's Lua, Cairo and script extension points remain available in the
 upstream-compatible build. Runtime hardening must preserve them rather than
