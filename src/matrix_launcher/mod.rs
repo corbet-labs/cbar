@@ -2,6 +2,18 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::OnceLock;
+
+fn owner_tracing_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CBAR_LAUNCHER_TRACE").is_some())
+}
+
+fn owner_trace(fields: std::fmt::Arguments<'_>) {
+    if owner_tracing_on() {
+        eprintln!("cbar-launcher-owner-trace {fields}");
+    }
+}
 
 #[derive(Default)]
 struct PreparationOrder(Cell<u64>);
@@ -100,6 +112,7 @@ impl Launcher {
             return;
         }
         let generation = self.preparation_order.begin();
+        owner_trace(format_args!("prepare-start generation={generation}"));
         let launcher = self.clone();
         let prepared = crate::Ironbar::runtime()
             .handle()
@@ -133,6 +146,12 @@ impl Launcher {
                 Err(error) => eprintln!("cbar launcher: preparation worker failed: {error}"),
             }
             launcher.initializing.set(false);
+            owner_trace(format_args!(
+                "prepare-finish generation={generation} current={} desired_visible={} status={}",
+                launcher.preparation_order.is_current(generation),
+                launcher.desired_visible.get(),
+                launcher.status()
+            ));
         });
     }
 
