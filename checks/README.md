@@ -23,4 +23,4 @@ All launcher inventory, configuration, mutable state, caches, IPC, D-Bus, and Wa
 under one private temporary directory. `HOME` and inherited compositor socket variables are removed
 before startup, so the check cannot read personal configuration or target the caller's graphical
 session. The compositor, cbar, and virtual-keyboard drivers each run in an owned session group;
-cleanup sends the whole group bounded `TERM` then `KILL`, including wrapper descendants.
+cleanup sends the whole group bounded `TERM` then `KILL`, including in-group wrapper descendants.

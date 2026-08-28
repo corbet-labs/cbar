@@ -386,6 +386,26 @@ wait_for_counter_above() {
     fail "$label did not complete (counter stayed at $current)"
 }
 
+require_resident_quiet_window() {
+    local expected_maps=$1
+    local label=$2
+    local status=
+    local maps=0
+    # One full second is comfortably longer than the headless map/configure/present round trip.
+    # Poll throughout it: a single sleep followed by one observation could miss a transient reopen.
+    for _ in $(seq 1 20); do
+        status=$(launcher_status || true)
+        maps=$(count_launcher_maps)
+        [[ $status == resident ]] ||
+            fail "$label: launcher left resident state (status=${status:-none})"
+        (( maps == expected_maps )) ||
+            fail "$label: launcher map count changed from $expected_maps to $maps"
+        process_group_alive "$bar_pid" || fail "cbar exited during $label"
+        sleep 0.05
+    done
+    printf 'launcher quiet_ms=1000 maps=%s status=resident\n' "$expected_maps"
+}
+
 # Warmup must build one hidden resident UI before the race test starts. This makes the first show a
 # true resident map and lets the refresh below exercise replacement/visibility ownership directly.
 wait_for_status resident "launcher warmup"
@@ -424,13 +444,15 @@ prepare_before=$(count_preparation_finishes)
 wait_for_counter_above count_preparation_finishes "$prepare_before" "post-dismiss refresh"
 [[ $(launcher_status) == resident ]] || fail "async refresh reopened an internally dismissed launcher"
 [[ $(count_launcher_maps) -eq $first_maps ]] || fail "async refresh emitted a new launcher map"
+require_resident_quiet_window "$first_maps" "post-dismiss refresh quiet window"
 
 # Explicit show/hide remains resident and reuses the same process/window ownership path.
+explicit_maps_before=$(count_launcher_maps)
 prepare_before=$(count_preparation_finishes)
 "$cbar" launcher show >/dev/null
 wait_for_status visible "second resident show"
 wait_for_counter_above count_preparation_finishes "$prepare_before" "second show preparation"
-wait_for_counter_above count_launcher_maps "$first_maps" "second launcher map"
+wait_for_counter_above count_launcher_maps "$explicit_maps_before" "second launcher map"
 "$cbar" launcher hide >/dev/null
 wait_for_status resident "explicit hide"
 
