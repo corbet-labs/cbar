@@ -349,6 +349,7 @@ dependencies = [
  "dirs",
  "gtk4",
  "gtk4-layer-shell",
+ "ironbar-launch-service",
  "libc",
  "serde_json",
  "sha2",
@@ -1973,6 +1974,7 @@ name = "ironbar-launch-service"
 version = "0.1.0"
 dependencies = [
  "futures-channel",
+ "futures-executor",
  "libc",
  "rustix 1.1.4",
  "thiserror 2.0.20",

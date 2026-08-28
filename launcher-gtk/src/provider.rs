@@ -32,8 +32,29 @@ const MAX_TOTAL_INVENTORY_APPS: usize = 32_768;
 const MAX_CONCURRENT_PROVIDER_COMMANDS: usize = 32;
 const MAX_CONCURRENT_CACHE_READS: usize = 4;
 const CACHE_PREPARE_WAIT: Duration = Duration::from_millis(50);
-static NEXT_PROVIDER_GENERATION: AtomicU64 = AtomicU64::new(1);
-static LATEST_PROVIDER_GENERATION: AtomicU64 = AtomicU64::new(0);
+static NEXT_PROVIDER_EPOCH: AtomicU64 = AtomicU64::new(1);
+static LATEST_PROVIDER_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct CacheGeneration {
+    manager_epoch: u64,
+    provider_revision: u64,
+}
+
+impl CacheGeneration {
+    const fn new(manager_epoch: u64, provider_revision: u64) -> Self {
+        Self {
+            manager_epoch,
+            provider_revision,
+        }
+    }
+}
+
+struct CacheWriteReservation {
+    path: PathBuf,
+    generation: CacheGeneration,
+    gate: Arc<std::sync::Mutex<CacheGeneration>>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderSpec {
@@ -81,7 +102,20 @@ type Runner = Arc<dyn Fn(ProviderSpec) -> ProviderFuture + Send + Sync>;
 
 trait Cache: Send + Sync {
     fn load(&self, machine: &str, limit: usize) -> Option<Vec<u8>>;
-    fn store(&self, machine: &str, inventory: &[u8], generation: u64) -> Result<(), String>;
+    fn reserve_store(
+        &self,
+        _machine: &str,
+        _generation: CacheGeneration,
+    ) -> Result<Option<CacheWriteReservation>, String> {
+        Ok(None)
+    }
+    fn store(
+        &self,
+        machine: &str,
+        inventory: &[u8],
+        generation: CacheGeneration,
+        reservation: Option<CacheWriteReservation>,
+    ) -> Result<(), String>;
 }
 
 #[derive(Clone)]
@@ -226,8 +260,8 @@ impl ProviderManager {
         let (updates_tx, updates_rx) = watch::channel(vec![None; specs.len()]);
         let (refresh, refresh_rx) = watch::channel(0u64);
         let mut tasks = Vec::with_capacity(specs.len());
-        let cache_generation = NEXT_PROVIDER_GENERATION.fetch_add(1, Ordering::Relaxed);
-        LATEST_PROVIDER_GENERATION.fetch_max(cache_generation, Ordering::Release);
+        let cache_epoch = NEXT_PROVIDER_EPOCH.fetch_add(1, Ordering::Relaxed);
+        LATEST_PROVIDER_EPOCH.fetch_max(cache_epoch, Ordering::Release);
         let concurrency = Arc::new(tokio::sync::Semaphore::new(provider_concurrency(
             specs.len(),
         )));
@@ -246,7 +280,7 @@ impl ProviderManager {
                 subrows.clone(),
                 concurrency.clone(),
                 cache_concurrency.clone(),
-                cache_generation,
+                cache_epoch,
             )));
         }
         drop(updates_tx);
@@ -340,7 +374,7 @@ async fn provider_loop(
     subrows: Arc<std::collections::HashMap<String, Vec<config::SubRow>>>,
     concurrency: Arc<tokio::sync::Semaphore>,
     cache_concurrency: Arc<tokio::sync::Semaphore>,
-    cache_generation: u64,
+    cache_epoch: u64,
 ) {
     // Cache I/O happens inside this machine's own provider task. Starting or revealing the
     // launcher therefore performs no disk or network waits on GTK's thread.
@@ -405,6 +439,7 @@ async fn provider_loop(
     }
     let mut failures = 0u32;
     let mut last_was_online = false;
+    let mut cache_revision = 0u64;
 
     loop {
         let Ok(permit) = concurrency.clone().acquire_owned().await else {
@@ -546,6 +581,20 @@ async fn provider_loop(
                 let machine_for_store = spec.name.clone();
                 let machine_for_log = machine_for_store.clone();
                 let cache_concurrency = cache_concurrency.clone();
+                cache_revision = cache_revision.saturating_add(1);
+                let cache_generation = CacheGeneration::new(cache_epoch, cache_revision);
+                let reservation = match cache_for_store
+                    .reserve_store(&machine_for_store, cache_generation)
+                {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        warn!(machine = %machine_for_log, "unable to reserve launcher inventory cache write: {error}");
+                        if refresh.changed().await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                };
                 tokio::spawn(async move {
                     let Ok(Ok(cache_permit)) =
                         tokio::time::timeout(CACHE_PREPARE_WAIT, cache_concurrency.acquire_owned())
@@ -555,7 +604,12 @@ async fn provider_loop(
                     };
                     let stored = tokio::task::spawn_blocking(move || {
                         let _cache_permit = cache_permit;
-                        cache_for_store.store(&machine_for_store, &bytes, cache_generation)
+                        cache_for_store.store(
+                            &machine_for_store,
+                            &bytes,
+                            cache_generation,
+                            reservation,
+                        )
                     })
                     .await;
                     match stored {
@@ -882,7 +936,13 @@ impl Cache for NullCache {
         None
     }
 
-    fn store(&self, _machine: &str, _inventory: &[u8], _generation: u64) -> Result<(), String> {
+    fn store(
+        &self,
+        _machine: &str,
+        _inventory: &[u8],
+        _generation: CacheGeneration,
+        _reservation: Option<CacheWriteReservation>,
+    ) -> Result<(), String> {
         Ok(())
     }
 }
@@ -941,7 +1001,21 @@ impl Cache for DiskCache {
         (bytes.len() <= limit).then_some(bytes)
     }
 
-    fn store(&self, machine: &str, inventory: &[u8], generation: u64) -> Result<(), String> {
+    fn reserve_store(
+        &self,
+        machine: &str,
+        generation: CacheGeneration,
+    ) -> Result<Option<CacheWriteReservation>, String> {
+        reserve_cache_generation(&self.path(machine), generation).map(Some)
+    }
+
+    fn store(
+        &self,
+        machine: &str,
+        inventory: &[u8],
+        generation: CacheGeneration,
+        reservation: Option<CacheWriteReservation>,
+    ) -> Result<(), String> {
         if inventory.len() > MAX_INVENTORY_BYTES {
             return Err(format!("inventory exceeded {MAX_INVENTORY_BYTES} bytes"));
         }
@@ -955,7 +1029,15 @@ impl Cache for DiskCache {
             .map_err(|error| format!("{}: {error}", self.root.display()))?;
 
         let path = self.path(machine);
-        serialize_cache_generation(&path, generation, || {
+        let reservation = match reservation {
+            Some(reservation)
+                if reservation.path == path && reservation.generation == generation =>
+            {
+                reservation
+            }
+            _ => reserve_cache_generation(&path, generation)?,
+        };
+        serialize_cache_reservation(reservation, || {
             static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
             let suffix = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
             let tmp = self
@@ -984,25 +1066,10 @@ impl Cache for DiskCache {
     }
 }
 
-fn serialize_cache_generation(
+fn reserve_cache_generation(
     path: &std::path::Path,
-    generation: u64,
-    write: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
-    serialize_cache_generation_with(
-        path,
-        generation,
-        || LATEST_PROVIDER_GENERATION.load(Ordering::Acquire),
-        write,
-    )
-}
-
-fn serialize_cache_generation_with(
-    path: &std::path::Path,
-    generation: u64,
-    current_generation: impl FnOnce() -> u64,
-    write: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
+    generation: CacheGeneration,
+) -> Result<CacheWriteReservation, String> {
     let gate = {
         let mut writes = cache_generation_registry()
             .lock()
@@ -1011,32 +1078,79 @@ fn serialize_cache_generation_with(
         match writes.get(path).and_then(std::sync::Weak::upgrade) {
             Some(gate) => gate,
             None => {
-                let gate = Arc::new(std::sync::Mutex::new(0));
+                let gate = Arc::new(std::sync::Mutex::new(CacheGeneration::default()));
                 writes.insert(path.to_path_buf(), Arc::downgrade(&gate));
                 gate
             }
         }
     };
-    let mut newest = gate.lock().map_err(|_| {
+    {
+        let mut newest = gate.lock().map_err(|_| {
+            format!(
+                "launcher cache generation lock for {} was poisoned",
+                path.display()
+            )
+        })?;
+        *newest = (*newest).max(generation);
+    }
+    Ok(CacheWriteReservation {
+        path: path.to_path_buf(),
+        generation,
+        gate,
+    })
+}
+
+fn serialize_cache_reservation(
+    reservation: CacheWriteReservation,
+    write: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    serialize_cache_reservation_with(
+        reservation,
+        || LATEST_PROVIDER_EPOCH.load(Ordering::Acquire),
+        write,
+    )
+}
+
+fn serialize_cache_reservation_with(
+    reservation: CacheWriteReservation,
+    current_epoch: impl FnOnce() -> u64,
+    write: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let CacheWriteReservation {
+        path,
+        generation,
+        gate,
+    } = reservation;
+    let newest = gate.lock().map_err(|_| {
         format!(
             "launcher cache generation lock for {} was poisoned",
             path.display()
         )
     })?;
-    if generation < current_generation() || generation < *newest {
+    if generation.manager_epoch < current_epoch() || generation < *newest {
         drop(newest);
-        release_cache_generation_gate(path, &gate);
+        release_cache_generation_gate(&path, &gate);
         return Ok(());
     }
-    *newest = generation;
     let result = write();
     drop(newest);
-    release_cache_generation_gate(path, &gate);
+    release_cache_generation_gate(&path, &gate);
     result
 }
 
+#[cfg(test)]
+fn serialize_cache_generation_with(
+    path: &std::path::Path,
+    generation: CacheGeneration,
+    current_epoch: impl FnOnce() -> u64,
+    write: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let reservation = reserve_cache_generation(path, generation)?;
+    serialize_cache_reservation_with(reservation, current_epoch, write)
+}
+
 type CacheGenerationRegistry =
-    std::collections::HashMap<PathBuf, std::sync::Weak<std::sync::Mutex<u64>>>;
+    std::collections::HashMap<PathBuf, std::sync::Weak<std::sync::Mutex<CacheGeneration>>>;
 
 fn cache_generation_registry() -> &'static std::sync::Mutex<CacheGenerationRegistry> {
     static WRITES: std::sync::OnceLock<std::sync::Mutex<CacheGenerationRegistry>> =
@@ -1044,7 +1158,10 @@ fn cache_generation_registry() -> &'static std::sync::Mutex<CacheGenerationRegis
     WRITES.get_or_init(Default::default)
 }
 
-fn release_cache_generation_gate(path: &std::path::Path, gate: &Arc<std::sync::Mutex<u64>>) {
+fn release_cache_generation_gate(
+    path: &std::path::Path,
+    gate: &Arc<std::sync::Mutex<CacheGeneration>>,
+) {
     let Ok(mut writes) = cache_generation_registry().lock() else {
         return;
     };
@@ -1097,7 +1214,13 @@ mod tests {
                 .cloned()
         }
 
-        fn store(&self, machine: &str, inventory: &[u8], _generation: u64) -> Result<(), String> {
+        fn store(
+            &self,
+            machine: &str,
+            inventory: &[u8],
+            _generation: CacheGeneration,
+            _reservation: Option<CacheWriteReservation>,
+        ) -> Result<(), String> {
             self.0
                 .lock()
                 .map_err(|_| "cache poisoned".to_string())?
@@ -1269,7 +1392,7 @@ mod tests {
     async fn cached_inventory_remains_usable_and_is_marked_offline() {
         let cache = Arc::new(MemoryCache::default());
         cache
-            .store("remote", &valid("remote"), 1)
+            .store("remote", &valid("remote"), CacheGeneration::new(1, 1), None)
             .expect("seed cache");
         let runner: Runner = Arc::new(|_| {
             Box::pin(async {
@@ -1392,7 +1515,8 @@ mod tests {
                 &self,
                 _machine: &str,
                 _inventory: &[u8],
-                _generation: u64,
+                _generation: CacheGeneration,
+                _reservation: Option<CacheWriteReservation>,
             ) -> Result<(), String> {
                 Ok(())
             }
@@ -1426,7 +1550,8 @@ mod tests {
                 &self,
                 _machine: &str,
                 _inventory: &[u8],
-                _generation: u64,
+                _generation: CacheGeneration,
+                _reservation: Option<CacheWriteReservation>,
             ) -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(250));
                 Ok(())
@@ -1521,7 +1646,16 @@ mod tests {
         symlink(&target, &root).expect("create isolated cache symlink");
         let cache = DiskCache::new(root.clone());
 
-        assert!(cache.store("machine", &valid("machine"), 1).is_err());
+        assert!(
+            cache
+                .store(
+                    "machine",
+                    &valid("machine"),
+                    CacheGeneration::new(u64::MAX, 1),
+                    None,
+                )
+                .is_err()
+        );
         assert!(cache.load("machine", MAX_INVENTORY_BYTES).is_none());
         assert_eq!(
             std::fs::read_dir(&target).unwrap().count(),
@@ -1544,10 +1678,26 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cache = DiskCache::new(root.clone());
-        assert!(cache.store("machine", &valid("machine"), 1).is_err());
+        assert!(
+            cache
+                .store(
+                    "machine",
+                    &valid("machine"),
+                    CacheGeneration::new(u64::MAX, 1),
+                    None,
+                )
+                .is_err()
+        );
 
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        cache.store("machine", &valid("machine"), 2).unwrap();
+        cache
+            .store(
+                "machine",
+                &valid("machine"),
+                CacheGeneration::new(u64::MAX, 2),
+                None,
+            )
+            .unwrap();
         let path = cache.path("machine");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(cache.load("machine", MAX_INVENTORY_BYTES).is_none());
@@ -1575,7 +1725,7 @@ mod tests {
             move || {
                 serialize_cache_generation_with(
                     &path,
-                    2,
+                    CacheGeneration::new(2, 1),
                     || 2,
                     || {
                         entered.wait();
@@ -1594,7 +1744,7 @@ mod tests {
             move || {
                 serialize_cache_generation_with(
                     &path,
-                    1,
+                    CacheGeneration::new(1, 1),
                     || 2,
                     || {
                         writes.lock().unwrap().push(1);
@@ -1621,7 +1771,7 @@ mod tests {
             NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
         ));
         let writes = Arc::new(Mutex::new(Vec::new()));
-        serialize_cache_generation_with(&path, 2, || 2, {
+        serialize_cache_generation_with(&path, CacheGeneration::new(2, 1), || 2, {
             let writes = writes.clone();
             move || {
                 writes.lock().unwrap().push(2);
@@ -1636,7 +1786,7 @@ mod tests {
                 .get(&path)
                 .is_none()
         );
-        serialize_cache_generation_with(&path, 1, || 2, {
+        serialize_cache_generation_with(&path, CacheGeneration::new(1, 1), || 2, {
             let writes = writes.clone();
             move || {
                 writes.lock().unwrap().push(1);
@@ -1648,10 +1798,51 @@ mod tests {
     }
 
     #[test]
+    fn same_manager_older_refresh_cannot_overwrite_newer_after_it_finishes() {
+        let path = PathBuf::from(format!(
+            "/cache-same-manager-out-of-order-{}",
+            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let writes = Arc::new(Mutex::new(Vec::new()));
+
+        // Reservations happen when provider results are published, before either blocking cache
+        // closure is admitted. The older pending reservation pins the gate while the newer write
+        // runs and retires first.
+        let older = reserve_cache_generation(&path, CacheGeneration::new(7, 1)).unwrap();
+        let newer = reserve_cache_generation(&path, CacheGeneration::new(7, 2)).unwrap();
+        serialize_cache_reservation_with(newer, || 7, {
+            let writes = writes.clone();
+            move || {
+                writes.lock().unwrap().push(2);
+                Ok(())
+            }
+        })
+        .unwrap();
+        serialize_cache_reservation_with(older, || 7, {
+            let writes = writes.clone();
+            move || {
+                writes.lock().unwrap().push(1);
+                Ok(())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(*writes.lock().unwrap(), [2]);
+        assert!(
+            cache_generation_registry()
+                .lock()
+                .unwrap()
+                .get(&path)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn retired_cache_paths_do_not_accumulate_generation_gates() {
         for index in 0..4_096 {
             let path = PathBuf::from(format!("/cache-churn/{index}"));
-            serialize_cache_generation_with(&path, 1, || 1, || Ok(())).unwrap();
+            serialize_cache_generation_with(&path, CacheGeneration::new(1, 1), || 1, || Ok(()))
+                .unwrap();
         }
         assert!(
             cache_generation_registry()

@@ -125,6 +125,9 @@ fn inventory_blocking(
     Ok(encoded)
 }
 
+// These are independent scan bounds/counters rather than one hidden mutable context; keeping each
+// visible at the call site makes the cancellation and cumulative-budget contract auditable.
+#[allow(clippy::too_many_arguments)]
 fn scan_entries<I>(
     directory: &Path,
     walk: I,

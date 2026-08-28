@@ -159,7 +159,7 @@ fn theme_stamp(theme: &ThemeSnapshot) -> Option<u64> {
     let mut visited_directories = 0usize;
     for root in &theme.roots {
         root.hash(&mut stamp);
-        if let Ok(modified) = std::fs::metadata(&root).and_then(|m| m.modified()) {
+        if let Ok(modified) = std::fs::metadata(root).and_then(|m| m.modified()) {
             modified.hash(&mut stamp);
         }
         let Ok(themes) = std::fs::read_dir(root) else {

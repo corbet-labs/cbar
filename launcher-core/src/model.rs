@@ -426,8 +426,14 @@ fn enqueue_write(path: PathBuf, job: WriteJob) {
             }
         })
         .is_err()
-        && let Ok(mut pending) = writes.pending.lock()
-        && let Some(active) = pending.get_mut(&path)
+    {
+        mark_writer_spawn_failed(writes, &path);
+    }
+}
+
+fn mark_writer_spawn_failed(writes: &WriteRegistry, path: &Path) {
+    if let Ok(mut pending) = writes.pending.lock()
+        && let Some(active) = pending.get_mut(path)
     {
         active.active = false;
         active.latest.take();
@@ -3041,5 +3047,47 @@ mod tests {
         enqueue_write(path.clone(), Box::new(|_| Ok(())));
         assert!(wait_for_state_writes(std::time::Duration::from_secs(2)));
         assert!(pending_write_error(&path).is_none());
+    }
+
+    #[test]
+    fn writer_spawn_failure_settles_the_generation_and_is_readable() {
+        let path = std::env::temp_dir().join(format!(
+            "cbar-launcher-state-spawn-failure-test-{}-{}",
+            std::process::id(),
+            TEST_TMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let writes = write_registry();
+        {
+            let mut pending = writes.pending.lock().unwrap();
+            pending.insert(
+                path.clone(),
+                PendingWrite {
+                    latest: Some((17, Box::new(|_| Ok(())))),
+                    active: true,
+                    submitted: 17,
+                    completed: 0,
+                    last_error: None,
+                },
+            );
+        }
+
+        mark_writer_spawn_failed(writes, &path);
+
+        {
+            let pending = writes.pending.lock().unwrap();
+            let state = pending.get(&path).unwrap();
+            assert!(!state.active);
+            assert!(state.latest.is_none());
+            assert_eq!(state.completed, state.submitted);
+            assert_eq!(
+                state.last_error.as_deref(),
+                Some("unable to start launcher state writer")
+            );
+        }
+        assert_eq!(
+            read_state(&path).unwrap_err(),
+            "unable to start launcher state writer"
+        );
+        writes.pending.lock().unwrap().remove(&path);
     }
 }

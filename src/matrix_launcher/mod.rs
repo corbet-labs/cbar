@@ -3,12 +3,31 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+#[derive(Default)]
+struct PreparationOrder(Cell<u64>);
+
+impl PreparationOrder {
+    fn begin(&self) -> u64 {
+        let mut generation = self.0.get().wrapping_add(1);
+        if generation == 0 {
+            generation = 1;
+        }
+        self.0.set(generation);
+        generation
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.0.get() == generation
+    }
+}
+
 #[derive(Clone)]
 pub struct Launcher {
     application: gtk::Application,
     ui: Rc<RefCell<Option<cbar_launcher::LauncherUi>>>,
     display: Rc<RefCell<Option<gtk::gdk::Display>>>,
     initializing: Rc<Cell<bool>>,
+    preparation_order: Rc<PreparationOrder>,
     desired_visible: Rc<Cell<bool>>,
 }
 
@@ -28,6 +47,7 @@ impl Launcher {
             ui: Rc::new(RefCell::new(None)),
             display: Rc::new(RefCell::new(None)),
             initializing: Rc::new(Cell::new(false)),
+            preparation_order: Rc::new(PreparationOrder::default()),
             desired_visible: Rc::new(Cell::new(false)),
         }
     }
@@ -36,12 +56,16 @@ impl Launcher {
     /// Ironbar setup therefore pays no launcher disk/theme work, and even configured setups get
     /// their bar first. Explicit show remains able to initialize on demand if it wins the race.
     pub fn warm(&self) {
+        let generation = self.preparation_order.begin();
         let launcher = self.clone();
         let prepared = crate::Ironbar::runtime()
             .handle()
             .spawn_blocking(cbar_launcher::prepare_if_configured);
         gtk::glib::spawn_future_local(async move {
             if let Ok(Some(prepared)) = prepared.await {
+                if !launcher.preparation_order.is_current(generation) {
+                    return;
+                }
                 let Some(display) = launcher.launcher_display() else {
                     eprintln!("cbar launcher: unable to open a GDK display");
                     return;
@@ -50,7 +74,9 @@ impl Launcher {
                 let prepared = crate::Ironbar::runtime()
                     .handle()
                     .spawn_blocking(move || cbar_launcher::prepare_icons(prepared, theme));
-                if let Ok(prepared) = prepared.await {
+                if let Ok(prepared) = prepared.await
+                    && launcher.preparation_order.is_current(generation)
+                {
                     launcher.ensure_initialized_with(prepared, &display);
                 }
             }
@@ -66,6 +92,7 @@ impl Launcher {
         if self.initializing.replace(true) {
             return;
         }
+        let generation = self.preparation_order.begin();
         let launcher = self.clone();
         let prepared = crate::Ironbar::runtime()
             .handle()
@@ -73,6 +100,10 @@ impl Launcher {
         gtk::glib::spawn_future_local(async move {
             match prepared.await {
                 Ok(prepared) => {
+                    if !launcher.preparation_order.is_current(generation) {
+                        launcher.initializing.set(false);
+                        return;
+                    }
                     let Some(display) = launcher.launcher_display() else {
                         eprintln!("cbar launcher: unable to open a GDK display");
                         launcher.initializing.set(false);
@@ -83,7 +114,10 @@ impl Launcher {
                         .handle()
                         .spawn_blocking(move || cbar_launcher::prepare_icons(prepared, theme));
                     match prepared.await {
-                        Ok(prepared) => launcher.ensure_initialized_with(prepared, &display),
+                        Ok(prepared) if launcher.preparation_order.is_current(generation) => {
+                            launcher.ensure_initialized_with(prepared, &display);
+                        }
+                        Ok(_) => {}
                         Err(error) => {
                             eprintln!("cbar launcher: icon preparation worker failed: {error}")
                         }
@@ -200,5 +234,24 @@ impl Launcher {
             .borrow()
             .as_ref()
             .is_some_and(|ui| ui.owns_window(window))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PreparationOrder;
+
+    #[test]
+    fn newest_started_preparation_wins_even_when_it_finishes_first() {
+        let order = PreparationOrder::default();
+        let slow_warm = order.begin();
+        let explicit_show = order.begin();
+
+        assert!(order.is_current(explicit_show));
+        assert!(!order.is_current(slow_warm));
+
+        // Finishing the stale warmup later cannot make it current again.
+        assert!(!order.is_current(slow_warm));
+        assert!(order.is_current(explicit_show));
     }
 }

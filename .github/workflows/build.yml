@@ -115,6 +115,22 @@ jobs:
       - name: Verify launch service package
         run: cargo package --manifest-path launch-service/Cargo.toml --allow-dirty
 
+      - name: Verify launcher core package
+        run: cargo package --manifest-path launcher-core/Cargo.toml --allow-dirty
+
+      - name: Verify launcher GTK package
+        run: >-
+          cargo package --manifest-path launcher-gtk/Cargo.toml --allow-dirty
+          --config "patch.crates-io.cbar-launcher-core.path='${GITHUB_WORKSPACE}/launcher-core'"
+          --config "patch.crates-io.ironbar-launch-service.path='${GITHUB_WORKSPACE}/launch-service'"
+
+      - name: Verify root package with staged launcher crates
+        run: >-
+          cargo package --allow-dirty
+          --config "patch.crates-io.cbar-launcher.path='${GITHUB_WORKSPACE}/launcher-gtk'"
+          --config "patch.crates-io.cbar-launcher-core.path='${GITHUB_WORKSPACE}/launcher-core'"
+          --config "patch.crates-io.ironbar-launch-service.path='${GITHUB_WORKSPACE}/launch-service'"
+
   feature-checks:
     name: 'Check feature flag'
     runs-on: ubuntu-latest

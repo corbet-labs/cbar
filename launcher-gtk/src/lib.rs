@@ -30,6 +30,7 @@ use gtk::{
     Label, Orientation,
 };
 use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell};
+use ironbar_launch_service::{submit_detached_batch, warm_launch_service};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -611,8 +612,6 @@ const MIN_SEARCH_WIDTH: i32 = 200;
 /// Anonymous and writable only, and never the stack: this is about data the program is finished
 /// with for now, not about pages it is standing on. A failure anywhere is ignored -- the kernel
 /// declining to reclaim is not a reason for a launcher to misbehave.
-/// The last thing every machine printed, kept so an unchanged answer can be recognised without
-/// parsing it. See `inventory_bytes` for why the raw output is the right thing to compare.
 /// Whether to print the machine-readable trace, decided once from `CBAR_LAUNCHER_TRACE`.
 fn tracing_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1027,7 +1026,7 @@ fn build(
     prepared: PreparedLauncher,
     display: &gtk::gdk::Display,
 ) -> LauncherUi {
-    warm_user_service_capability(runtime);
+    warm_launch_service();
     let source_config = prepared.config.as_ref().ok().and_then(Clone::clone);
     let state_baseline = prepared.state_snapshot();
     let prepared_icons = prepared.icons;
@@ -2880,30 +2879,11 @@ fn config_colors_are_valid(config: &config::Config) -> bool {
     canonicalize_config_colors(&mut checked).is_ok()
 }
 
-/// Ask EVERY machine what it has, all at once.
-///
-/// One thread per machine, because the answer for a remote one is an SSH round trip and asking
-/// them in turn makes the launcher wait for the sum of them. Measured on a three-machine config
-/// with a cold inventory cache: 66ms + 269ms + 324ms sequentially, where the two remote ones are
-/// each a fresh SSH connection. Concurrently that is bounded by the slowest, not the total, and
-/// the launcher opens a third of a second sooner.
-///
-/// This is the ONLY place in the program where concurrency buys anything. Everything downstream of
-/// here is GTK, which is single-threaded by construction -- so nothing else is a candidate, and the
-/// rest of the startup cost has to come out of doing less work rather than doing it in more places.
-///
-/// Scoped threads specifically: they can borrow `rows` and the configs directly, so nothing has to
-/// be cloned into each thread, and the scope cannot outlive the data by construction. The results
-/// are joined IN ORDER, so the column order the user declared survives -- which matters, because
-/// the first column is the one the launcher opens on.
-///
-/// A panicking thread yields that machine's column as unreachable rather than taking the process
-/// with it. One machine's inventory command is not a reason for the other two to be unavailable,
-/// and an inventory command is arbitrary user-supplied argv.
-/// Ask every machine at once and keep the answers unparsed.
-///
-/// Concurrency buys exactly one thing here, and this is it: asking is the only part that waits on
-/// something outside this process. Everything after it is arithmetic.
+/// Golden-Master test helper which asks every fixture machine concurrently and returns results in
+/// configured order. Production discovery uses `ProviderManager`: independently recovering
+/// per-machine state machines admitted through a hardware-aware bounded command lane. Keeping this
+/// scoped-thread version test-only preserves the old parity fixtures without making its unbounded
+/// one-thread-per-fixture policy a runtime claim.
 #[cfg(test)]
 #[allow(dead_code)]
 fn inventory_bytes_all(machines: &[config::MachineConfig]) -> Vec<Result<Vec<u8>, String>> {
@@ -2955,12 +2935,9 @@ fn inventory_all(
 /// point rather than a simplification.
 /// WHAT THE MACHINE PRINTED, unparsed -- or why it could not be asked.
 ///
-/// Split from building the grid because the BYTES are the identity of the answer. A resident
-/// launcher re-asks every machine on every open, and the overwhelmingly common outcome is that
-/// nothing has changed since the last open: measured on a real three-machine inventory, the refresh
-/// reported no change on every single reveal. Comparing the raw output first lets that case cost a
-/// spawn, a read and a memcmp, instead of parsing two hundred applications, regrouping them into
-/// rows and subrows, and then deep-comparing the result to discover it was identical.
+/// This direct command helper is retained only for Golden-Master tests. Production uses the
+/// independently recovering bounded provider manager, which hashes an answer before normalization
+/// and suppresses byte-identical refreshes without rebuilding GTK state.
 #[cfg(test)]
 #[allow(dead_code)]
 fn inventory_bytes(mc: &config::MachineConfig) -> Result<Vec<u8>, String> {
@@ -3249,16 +3226,11 @@ fn stop_child_group(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// Queue application starts away from GTK's shared event thread. The UI receives only the stable
-/// ids whose immediate handoff process was created; known refusals therefore never earn usage.
-///
-/// A NEW PROCESS GROUP ON PURPOSE. `process_group(0)` is `setpgid`, not `setsid`: a Ctrl-C aimed at
-/// the launcher's foreground process group does not reach the child. It neither creates a session
-/// nor drops the controlling terminal; an optional manager-created service provides the stronger
-/// isolation on systemd hosts.
-///
-/// Failures are reported, not swallowed: a missing binary is exactly the case where silence would
-/// look like the keypress never registered.
+/// Atomically queue one appset through the process-wide detached-launch service. Submission is a
+/// single all-or-none reservation: queue pressure can reject the set, but can never start only its
+/// first few applications. Tickets stay in input order, so each successful handoff maps back to
+/// the exact stable app id that earns usage. All process creation, manager probing and reaping live
+/// in the shared service; GTK only prepares owned argv and applies the completed identities.
 fn queue_launch(
     runtime: &tokio::runtime::Handle,
     machine: Machine,
@@ -3294,11 +3266,27 @@ fn queue_launch(
         .iter()
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
-    let worker = runtime.spawn_blocking(move || {
-        requests
-            .into_iter()
-            .map(|(key, request)| (key, spawn_request(request)))
-            .collect::<Vec<_>>()
+    let batch = requests
+        .iter()
+        .map(|(_, request)| request.argv.clone())
+        .collect::<Vec<_>>();
+    let tickets = match submit_detached_batch(batch) {
+        Ok(tickets) => tickets,
+        Err(error) => {
+            for key in queued_keys {
+                inflight.borrow_mut().remove(&key);
+            }
+            eprintln!("cbar launcher: launch batch was not queued: {error}");
+            completed(Vec::new());
+            return;
+        }
+    };
+    let worker = runtime.spawn(async move {
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for ((key, request), ticket) in requests.into_iter().zip(tickets) {
+            outcomes.push((key, request, ticket.await));
+        }
+        outcomes
     });
     gtk::glib::spawn_future_local(async move {
         let outcomes = match worker.await {
@@ -3313,21 +3301,20 @@ fn queue_launch(
             }
         };
         let mut launched = Vec::new();
-        for (key, outcome) in outcomes {
+        for (key, request, outcome) in outcomes {
             inflight.borrow_mut().remove(&key);
             match outcome {
-                Ok(outcome) => {
-                    if let Some(pid) = outcome.pid {
-                        let pid = gtk::glib::Pid(pid as _);
-                        gtk::glib::child_watch_add_local(pid, |_, _| {});
-                    }
+                Ok(_receipt) => {
                     eprintln!(
                         "cbar launcher: started {} on {}",
-                        outcome.app_name, outcome.machine_name
+                        request.app_name, request.machine_name
                     );
-                    launched.push(outcome.app_id);
+                    launched.push(request.app_id);
                 }
-                Err(error) => eprintln!("cbar launcher: {error}"),
+                Err(error) => eprintln!(
+                    "cbar launcher: {} on {}: {error}",
+                    request.app_name, request.machine_name
+                ),
             }
         }
         completed(launched);
@@ -3349,7 +3336,6 @@ struct LaunchRequest {
     app_name: String,
     machine_name: String,
     argv: Vec<String>,
-    manager_service: bool,
 }
 
 impl LaunchRequest {
@@ -3373,248 +3359,8 @@ impl LaunchRequest {
             app_name: app.name.clone(),
             machine_name: machine.name.clone(),
             argv,
-            manager_service: user_services_supported(),
         })
     }
-}
-
-struct LaunchOutcome {
-    app_id: String,
-    app_name: String,
-    machine_name: String,
-    pid: Option<u32>,
-}
-
-fn spawn_request(request: LaunchRequest) -> Result<LaunchOutcome, String> {
-    use std::os::unix::process::CommandExt;
-
-    let (bin, args) = request
-        .argv
-        .split_first()
-        .ok_or_else(|| format!("{} has no exec line", request.app_name))?;
-
-    // OUT OF OUR CGROUP AND IRREVERSIBLE SANDBOX, not merely out of our process group.
-    //
-    // A resident launcher runs as a systemd unit, and everything it spawns lands in that unit's
-    // cgroup. Restarting the unit then kills every application ever started from it -- including
-    // forwarded sessions to other machines, which take a visible moment to rebuild.
-    //
-    // `process_group(0)` below does NOT prevent this: it creates a new process group, while systemd
-    // kills by cgroup. The two hierarchies look interchangeable right up until a unit restarts.
-    //
-    // A transient SERVICE is created by the user manager, rather than `--scope`: a scoped payload
-    // is still forked by the caller and therefore inherits NoNewPrivileges, seccomp and mount
-    // namespace restrictions that cannot be undone after exec. The manager-created service starts
-    // from the manager's own execution context and survives cbar's unit being restarted.
-    //
-    // Falls back to a plain spawn where systemd-run is absent -- a launcher must not require an
-    // init system to start a program.
-    // `--setenv=NAME` asks systemd-run to copy that name from its own inherited environment into
-    // the manager-created service without putting values (including credentials) in argv. If an
-    // exotic environment name cannot be represented by the manager, preserve exact direct-spawn
-    // semantics instead of silently launching with a partial environment.
-    let service_environment = if request.manager_service {
-        service_environment_names()
-    } else {
-        None
-    };
-    let manager_service = service_environment.is_some();
-    let mut cmd = launch_command(
-        manager_service,
-        bin,
-        args,
-        service_environment.as_deref().unwrap_or_default(),
-    );
-    // Still a separate process group: the property is independent of whether a service exists.
-    cmd.process_group(0);
-    match cmd.spawn() {
-        Ok(mut child) => {
-            let pid = if manager_service {
-                // `spawn` only proves that the local systemd-run helper exec'd. Its zero exit is
-                // the bounded acknowledgement that the user manager accepted the transient
-                // service; a refusal or timeout must not earn usage or dismiss the launcher.
-                let status = wait_handoff(&mut child, std::time::Duration::from_secs(2))?;
-                if !status.success() {
-                    return Err(format!(
-                        "{} on {}: transient service handoff exited with {status}",
-                        request.app_name, request.machine_name
-                    ));
-                }
-                None
-            } else {
-                let pid = child.id();
-                // GTK registers the pid with its child watcher when this worker result arrives.
-                // Until then an exited direct child remains waitable and cannot race reaping.
-                drop(child);
-                Some(pid)
-            };
-            Ok(LaunchOutcome {
-                app_id: request.app_id,
-                app_name: request.app_name,
-                machine_name: request.machine_name,
-                pid,
-            })
-        }
-        Err(error) => Err(format!(
-            "{} on {}: {error}",
-            request.app_name, request.machine_name
-        )),
-    }
-}
-
-fn wait_handoff(
-    child: &mut std::process::Child,
-    timeout: std::time::Duration,
-) -> Result<std::process::ExitStatus, String> {
-    let started = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Ok(None) => {
-                // The helper still pins its process-group id until wait below. Do not direct-fall
-                // back: its DBus request may already have reached the manager, so retrying could
-                // launch the same application twice.
-                unsafe {
-                    libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-                }
-                let _ = child.wait();
-                return Err(format!(
-                    "transient service handoff acknowledgement timed out after {} ms; the service may already have been accepted and was not retried",
-                    timeout.as_millis()
-                ));
-            }
-            Err(error) => {
-                // The leader is still unreaped here, so its numeric process-group id cannot be
-                // recycled before this signal. Best-effort cleanup avoids detaching a helper on an
-                // unusual wait failure.
-                unsafe {
-                    libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-                }
-                let _ = child.wait();
-                return Err(format!("transient service handoff failed: {error}"));
-            }
-        }
-    }
-}
-
-fn launch_command(
-    manager_service: bool,
-    bin: &str,
-    args: &[String],
-    environment_names: &[std::ffi::OsString],
-) -> std::process::Command {
-    if manager_service {
-        let mut command = std::process::Command::new("systemd-run");
-        command.args([
-            "--user",
-            "--collect",
-            "--quiet",
-            "--service-type=exec",
-            "--expand-environment=no",
-            "--same-dir",
-        ]);
-        for name in environment_names {
-            command.arg(format!("--setenv={}", name.to_string_lossy()));
-        }
-        command.args(["--", bin]);
-        command.args(args);
-        command
-    } else {
-        let mut command = std::process::Command::new(bin);
-        command.args(args);
-        command
-    }
-}
-
-/// Names which systemd-run can copy losslessly from its own inherited environment. Values never
-/// enter argv. Returning `None` selects direct spawn, which preserves even non-POSIX environments
-/// rather than making the detached path subtly different.
-fn service_environment_names() -> Option<Vec<std::ffi::OsString>> {
-    const MAX_NAMES: usize = 4_096;
-    const MAX_NAME_BYTES: usize = 256 * 1024;
-
-    let mut names = Vec::new();
-    let mut bytes = 0usize;
-    for (name, _) in std::env::vars_os() {
-        let text = name.to_str()?;
-        let valid = !text.is_empty()
-            && text.bytes().enumerate().all(|(index, byte)| match byte {
-                b'A'..=b'Z' | b'a'..=b'z' | b'_' => true,
-                b'0'..=b'9' => index > 0,
-                _ => false,
-            });
-        if !valid {
-            return None;
-        }
-        bytes = bytes.checked_add(text.len())?;
-        names.push(name);
-        if names.len() > MAX_NAMES || bytes > MAX_NAME_BYTES {
-            return None;
-        }
-    }
-    names.sort_unstable();
-    names.dedup();
-    Some(names)
-}
-
-const USER_SERVICE_UNKNOWN: u8 = 0;
-const USER_SERVICE_PROBING: u8 = 1;
-const USER_SERVICE_UNAVAILABLE: u8 = 2;
-const USER_SERVICE_AVAILABLE: u8 = 3;
-static USER_SERVICE_STATE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(USER_SERVICE_UNKNOWN);
-
-/// Probe once in the background with a hard wall-clock bound. Until it completes, launching takes
-/// the portable plain-spawn path; the shared GTK event thread never waits for an init system.
-fn warm_user_service_capability(runtime: &tokio::runtime::Handle) {
-    use std::sync::atomic::Ordering;
-
-    if USER_SERVICE_STATE
-        .compare_exchange(
-            USER_SERVICE_UNKNOWN,
-            USER_SERVICE_PROBING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
-        return;
-    }
-    runtime.spawn(async {
-        let Some(environment_names) = service_environment_names() else {
-            USER_SERVICE_STATE.store(USER_SERVICE_UNAVAILABLE, Ordering::Release);
-            return;
-        };
-        // Exercise the exact detached-service flags used for applications. Older systemd-run
-        // versions which cannot disable `$` expansion, preserve cwd, copy the environment or use
-        // Type=exec fail this probe and leave the fully portable direct path active.
-        let command = launch_command(true, "true", &[], &environment_names);
-        let mut command = tokio::process::Command::from(command);
-        command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let supported =
-            tokio::time::timeout(std::time::Duration::from_millis(500), command.status())
-                .await
-                .is_ok_and(|result| result.is_ok_and(|status| status.success()));
-        USER_SERVICE_STATE.store(
-            if supported {
-                USER_SERVICE_AVAILABLE
-            } else {
-                USER_SERVICE_UNAVAILABLE
-            },
-            Ordering::Release,
-        );
-    });
-}
-
-fn user_services_supported() -> bool {
-    USER_SERVICE_STATE.load(std::sync::atomic::Ordering::Acquire) == USER_SERVICE_AVAILABLE
 }
 
 fn escape(s: &str) -> String {
@@ -4039,71 +3785,5 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("timed out after 50 ms"), "{error}");
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
-    }
-
-    #[test]
-    fn systemd_handoff_is_a_manager_created_service_and_preserves_argv() {
-        let args = [
-            "argument with spaces",
-            "$HOME",
-            "%n",
-            "%i",
-            "%%",
-            "semi;colon",
-        ]
-        .map(str::to_string)
-        .to_vec();
-        let environment = vec!["PATH".into(), "WAYLAND_DISPLAY".into()];
-        let command = launch_command(true, "/usr/bin/example", &args, &environment);
-        assert_eq!(command.get_program(), "systemd-run");
-        assert_eq!(
-            command
-                .get_args()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            [
-                "--user",
-                "--collect",
-                "--quiet",
-                "--service-type=exec",
-                "--expand-environment=no",
-                "--same-dir",
-                "--setenv=PATH",
-                "--setenv=WAYLAND_DISPLAY",
-                "--",
-                "/usr/bin/example",
-                "argument with spaces",
-                "$HOME",
-                "%n",
-                "%i",
-                "%%",
-                "semi;colon",
-            ]
-        );
-        assert!(
-            !command.get_args().any(|argument| argument == "--scope"),
-            "scope payloads inherit cbar's irreversible sandbox"
-        );
-    }
-
-    #[test]
-    fn manager_handoff_wait_is_bounded_and_reaps_the_helper() {
-        use std::os::unix::process::CommandExt;
-
-        let mut command = std::process::Command::new("sh");
-        command.args(["-c", "sleep 10"]).process_group(0);
-        let mut child = command.spawn().unwrap();
-        let started = std::time::Instant::now();
-        let error = wait_handoff(&mut child, std::time::Duration::from_millis(50)).unwrap_err();
-        assert!(error.contains("may already have been accepted"), "{error}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        assert!(child.try_wait().unwrap().is_some(), "helper was not reaped");
-
-        let mut command = std::process::Command::new("sh");
-        command.args(["-c", "exit 23"]).process_group(0);
-        let mut child = command.spawn().unwrap();
-        let status = wait_handoff(&mut child, std::time::Duration::from_secs(1)).unwrap();
-        assert_eq!(status.code(), Some(23));
-        assert!(child.try_wait().unwrap().is_some(), "helper was not reaped");
     }
 }
