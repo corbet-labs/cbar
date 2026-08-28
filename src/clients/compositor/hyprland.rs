@@ -417,10 +417,14 @@ impl Client {
 #[cfg(feature = "workspaces+hyprland")]
 impl super::WorkspaceClient for Client {
     fn focus(&self, target: WorkspaceTarget) {
+        let target = target.persistent_by_index();
         let res = if self.use_lua_dispatch {
             let workspace = match &target {
                 WorkspaceTarget::Id(id) => id.to_string(),
                 WorkspaceTarget::Name(name) => name.replace('\\', "\\\\").replace('"', "\\\""),
+                WorkspaceTarget::Persistent { .. } => {
+                    unreachable!("persistent target was resolved")
+                }
             };
             let arg = format!("{{workspace=\"{workspace}\"}}");
             Dispatch::call(DispatchType::Custom("hl.dsp.focus", &arg))
@@ -428,6 +432,9 @@ impl super::WorkspaceClient for Client {
             let identifier = match &target {
                 WorkspaceTarget::Id(id) => WorkspaceIdentifierWithSpecial::Id(*id as i32),
                 WorkspaceTarget::Name(name) => WorkspaceIdentifierWithSpecial::Name(name),
+                WorkspaceTarget::Persistent { .. } => {
+                    unreachable!("persistent target was resolved")
+                }
             };
             Dispatch::call(DispatchType::Workspace(identifier))
         };
@@ -463,6 +470,20 @@ impl super::WorkspaceClient for Client {
         }
 
         rx
+    }
+}
+
+#[cfg(all(test, feature = "workspaces+hyprland"))]
+mod workspace_target_tests {
+    use super::WorkspaceTarget;
+
+    #[test]
+    fn numeric_persistent_favourite_preserves_hyprland_id_semantics() {
+        let target = WorkspaceTarget::Persistent {
+            name: "2".to_string(),
+            index: Some(2),
+        };
+        assert_eq!(target.persistent_by_index(), WorkspaceTarget::Id(2));
     }
 }
 

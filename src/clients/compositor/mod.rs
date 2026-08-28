@@ -156,13 +156,35 @@ pub struct Workspace {
 
 /// Identifies a workspace to focus.
 ///
-/// Open workspaces use their compositor-assigned ID. Persistent favourites
-/// use their configured name while closed so the compositor can create them.
+/// Open workspaces use their compositor-assigned ID. A persistent favourite
+/// retains both its configured name and, when numeric, its configured index so
+/// each compositor adapter can preserve its native creation semantics.
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[cfg(feature = "workspaces")]
 pub enum WorkspaceTarget {
     Id(i64),
     Name(String),
+    Persistent { name: String, index: Option<i64> },
+}
+
+#[cfg(feature = "workspaces")]
+impl WorkspaceTarget {
+    pub(crate) fn persistent_by_name(&self) -> Self {
+        match self {
+            Self::Persistent { name, .. } => Self::Name(name.clone()),
+            target => target.clone(),
+        }
+    }
+
+    pub(crate) fn persistent_by_index(&self) -> Self {
+        match self {
+            Self::Persistent {
+                index: Some(index), ..
+            } => Self::Id(*index),
+            Self::Persistent { name, index: None } => Self::Name(name.clone()),
+            target => target.clone(),
+        }
+    }
 }
 
 /// Indicates workspace visibility.

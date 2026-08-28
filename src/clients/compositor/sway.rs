@@ -14,8 +14,8 @@ fn focus_command_for_target(
     target: &WorkspaceTarget,
     workspace: Option<&swayipc_async::Workspace>,
 ) -> Result<String, Report> {
-    match target {
-        WorkspaceTarget::Name(name) => Ok(format!("workspace {name}")),
+    match target.persistent_by_name() {
+        WorkspaceTarget::Name(name) => Ok(format!("workspace {}", quote_argument(&name)?)),
         WorkspaceTarget::Id(id) => {
             let workspace = workspace
                 .ok_or_else(|| Report::msg(format!("couldn't find workspace with id {id}")))?;
@@ -31,10 +31,34 @@ fn focus_command_for_target(
             if workspace.num >= 0 {
                 Ok(format!("workspace number {}", workspace.num))
             } else {
-                Ok(format!("workspace {}", workspace.name))
+                Ok(format!("workspace {}", quote_argument(&workspace.name)?))
             }
         }
+        WorkspaceTarget::Persistent { .. } => unreachable!("persistent target was resolved"),
     }
+}
+
+#[cfg(feature = "workspaces+sway")]
+fn quote_argument(value: &str) -> Result<String, Report> {
+    if value.contains('\0') {
+        return Err(Report::msg("workspace name contains a NUL byte"));
+    }
+
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '$' => quoted.push_str("$$"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    Ok(quoted)
 }
 
 #[cfg(feature = "workspaces+sway")]
@@ -44,12 +68,12 @@ impl super::WorkspaceClient for Client {
         spawn(async move {
             let mut client = client.lock().await;
 
-            let workspace = if let WorkspaceTarget::Id(id) = &target {
+            let workspace = if let WorkspaceTarget::Id(id) = target.persistent_by_name() {
                 client
                     .get_workspaces()
                     .await?
                     .into_iter()
-                    .find(|workspace| workspace.id == *id)
+                    .find(|workspace| workspace.id == id)
             } else {
                 None
             };
@@ -209,11 +233,24 @@ mod tests {
 
     #[test]
     fn closed_numbered_favourite_focuses_by_name() {
-        let target = WorkspaceTarget::Name("2".to_string());
+        let target = WorkspaceTarget::Persistent {
+            name: "2".to_string(),
+            index: Some(2),
+        };
 
         assert_eq!(
             focus_command_for_target(&target, None).expect("named target to produce a command"),
-            "workspace 2"
+            "workspace \"2\""
+        );
+    }
+
+    #[test]
+    fn workspace_names_are_one_quoted_command_argument() {
+        let target = WorkspaceTarget::Name("dev; reload, \"quoted\" $mod \\ tail\n".to_string());
+
+        assert_eq!(
+            focus_command_for_target(&target, None).expect("safe target to produce a command"),
+            "workspace \"dev; reload, \\\"quoted\\\" $$mod \\\\ tail\\n\""
         );
     }
 }

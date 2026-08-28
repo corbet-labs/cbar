@@ -42,11 +42,14 @@ impl WorkspaceBinding {
     fn focus_target(&self) -> WorkspaceTarget {
         self.workspace_id.map_or_else(
             || {
-                WorkspaceTarget::Name(
-                    self.favorite_name
-                        .clone()
-                        .expect("closed workspace button to be a favourite"),
-                )
+                let name = self
+                    .favorite_name
+                    .clone()
+                    .expect("closed workspace button to be a favourite");
+                WorkspaceTarget::Persistent {
+                    index: name.parse().ok(),
+                    name,
+                }
             },
             WorkspaceTarget::Id,
         )
@@ -214,11 +217,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn favourite_returns_to_named_target_after_empty_event() {
+    fn favourite_restores_its_persistent_identity_after_empty_event() {
         let mut binding = WorkspaceBinding::favorite("2");
         assert_eq!(
             binding.focus_target(),
-            WorkspaceTarget::Name("2".to_string())
+            WorkspaceTarget::Persistent {
+                name: "2".to_string(),
+                index: Some(2),
+            }
         );
 
         binding.open(42);
@@ -230,7 +236,21 @@ mod tests {
         assert!(binding.workspace_removed(42));
         assert_eq!(
             binding.focus_target(),
-            WorkspaceTarget::Name("2".to_string())
+            WorkspaceTarget::Persistent {
+                name: "2".to_string(),
+                index: Some(2),
+            }
+        );
+    }
+
+    #[test]
+    fn named_favourite_has_no_invented_numeric_identity() {
+        assert_eq!(
+            WorkspaceBinding::favorite("dev").focus_target(),
+            WorkspaceTarget::Persistent {
+                name: "dev".to_string(),
+                index: None,
+            }
         );
     }
 }

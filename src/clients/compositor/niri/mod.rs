@@ -197,6 +197,7 @@ impl Client {
 
 impl WorkspaceClient for Client {
     fn focus(&self, target: WorkspaceTarget) {
+        let target = target.persistent_by_index();
         debug!("focusing workspace: {target:?}");
 
         // this does annoyingly require spawning a separate connection for every focus call
@@ -207,6 +208,9 @@ impl WorkspaceClient for Client {
             let reference = match target {
                 WorkspaceTarget::Id(id) => WorkspaceReferenceArg::Id(id as u64),
                 WorkspaceTarget::Name(name) => WorkspaceReferenceArg::Name(name),
+                WorkspaceTarget::Persistent { .. } => {
+                    unreachable!("persistent target was resolved")
+                }
             };
             let command = Request::Action(Action::FocusWorkspace { reference });
 
@@ -228,5 +232,19 @@ impl WorkspaceClient for Client {
         }
 
         rx
+    }
+}
+
+#[cfg(all(test, feature = "workspaces+niri"))]
+mod workspace_target_tests {
+    use super::WorkspaceTarget;
+
+    #[test]
+    fn numeric_persistent_favourite_preserves_niri_id_semantics() {
+        let target = WorkspaceTarget::Persistent {
+            name: "2".to_string(),
+            index: Some(2),
+        };
+        assert_eq!(target.persistent_by_index(), WorkspaceTarget::Id(2));
     }
 }
