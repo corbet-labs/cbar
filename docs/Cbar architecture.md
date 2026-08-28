@@ -5,10 +5,17 @@ Ironbar's configuration model and module behaviour as a directly maintained
 superset while integrating the launcher and the native system graphs into the
 same runtime.
 
-The compatibility promise is source-level, not a translation layer: supported
-Ironbar configuration is parsed by the same configuration types. Cbar-specific
-features extend those types. There is no second legacy parser and no generated
-compatibility configuration.
+The bar compatibility promise is source-level, not a translation layer:
+supported Ironbar bar configuration is parsed by the same configuration types,
+and cbar-specific bar modules extend those types. There is no generated
+compatibility configuration or parser for retired runtime paths.
+
+The integrated launcher deliberately has a separate, bounded JSON schema and
+reload fault domain. An absent or invalid launcher configuration cannot make a
+valid bar configuration fall back or prevent the bar from starting. Under the
+current working namespace its default is
+`$XDG_CONFIG_HOME/cbar/launcher.json`, overridable with
+`$CBAR_LAUNCHER_CONFIG`; neither path is a compatibility alias for nixlaunch.
 
 ## Portability invariant
 
