@@ -19,15 +19,15 @@ use gtk::gdk::BUTTON_PRIMARY;
 use gtk::prelude::*;
 use gtk::{GestureClick, Tooltip};
 use hub::{GraphDemand, GraphHub};
+use ironbar_launch_service::{submit_detached_argv, warm_launch_service};
 use model::{GRAPH_HEIGHT, GraphFrame, Layout, Metric, MetricSet};
 use serde::Deserialize;
 use std::cell::RefCell;
-use std::process::Stdio;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
-use tracing::{error, warn};
+use tracing::error;
 
 #[derive(Debug, Default, Clone, Deserialize)]
 #[cfg_attr(feature = "extras", derive(schemars::JsonSchema))]
@@ -123,6 +123,9 @@ impl Module<gtk::Box> for SystemGraphModule {
     ) -> color_eyre::Result<()> {
         if info.bar_position.orientation() != gtk::Orientation::Horizontal {
             return Ok(());
+        }
+        if !self.network_actions.is_empty() {
+            warm_launch_service();
         }
         let hub = GraphHub::global();
         hub.register(&self.demand);
@@ -407,32 +410,19 @@ fn launch_network_action(action: &[String], metric: Metric, interface: &str) {
     let Some((program, arguments)) = prepare_network_action(action, metric, interface) else {
         return;
     };
-    spawn(async move {
-        let mut command = tokio::process::Command::new(&program);
-        command
-            .args(arguments)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.as_std_mut().process_group(0);
+    let mut argv = Vec::with_capacity(arguments.len() + 1);
+    argv.push(program.clone());
+    argv.extend(arguments);
+    let ticket = match submit_detached_argv(argv) {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            error!(?error, %program, "failed to queue native graph network action");
+            return;
         }
-
-        let result = match command.spawn() {
-            Ok(mut child) => child.wait().await,
-            Err(err) => {
-                error!(?err, %program, "failed to start native graph network action");
-                return;
-            }
-        };
-        match result {
-            Ok(status) if !status.success() => {
-                warn!(?status, %program, "native graph network action failed");
-            }
-            Err(err) => error!(?err, %program, "failed to reap native graph network action"),
-            _ => {}
+    };
+    spawn(async move {
+        if let Err(error) = ticket.await {
+            error!(?error, %program, "failed to hand off native graph network action");
         }
     });
 }
@@ -495,6 +485,7 @@ mod interaction_tests {
 
     #[test]
     fn category_actions_are_optional_and_data_driven() {
+        assert!(NetworkActions::default().is_empty());
         let actions = NetworkActions {
             wlan: Some(vec![
                 "network-ui".to_string(),
@@ -503,6 +494,7 @@ mod interaction_tests {
             ]),
             ..NetworkActions::default()
         };
+        assert!(!actions.is_empty());
         assert!(actions.get(Metric::Lan).is_none());
         let expected = ["network-ui", "{category}", "{interface}"].map(str::to_string);
         assert_eq!(actions.get(Metric::Wlan), Some(expected.as_slice()));

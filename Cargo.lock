@@ -1951,6 +1951,7 @@ dependencies = [
  "gtk4-layer-shell",
  "hyprland",
  "indexmap",
+ "ironbar-launch-service",
  "libpulse-binding",
  "lua-src",
  "mlua",
@@ -1978,6 +1979,17 @@ dependencies = [
  "wayland-client",
  "wayland-protocols-wlr",
  "zbus",
+]
+
+[[package]]
+name = "ironbar-launch-service"
+version = "0.1.0"
+dependencies = [
+ "futures-channel",
+ "libc",
+ "rustix 1.1.4",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
