@@ -21,6 +21,13 @@ impl PreparationOrder {
     }
 }
 
+fn record_internal_dismiss(desired_visible: &Cell<bool>, order: &PreparationOrder) {
+    desired_visible.set(false);
+    // A preparation that began for the showing which just ended must not be allowed to map its
+    // result afterwards. The next explicit show/refresh receives its own newer generation.
+    order.begin();
+}
+
 #[derive(Clone)]
 pub struct Launcher {
     application: gtk::Application,
@@ -146,23 +153,31 @@ impl Launcher {
         mut prepared: cbar_launcher::PreparedLauncher,
         display: &gtk::gdk::Display,
     ) {
+        let on_dismiss: Rc<dyn Fn()> = {
+            let desired_visible = self.desired_visible.clone();
+            let preparation_order = self.preparation_order.clone();
+            Rc::new(move || record_internal_dismiss(&desired_visible, &preparation_order))
+        };
         let current = self.ui.borrow().as_ref().cloned();
         match current {
             None => {
-                self.ui
-                    .replace(Some(cbar_launcher::LauncherUi::attach_prepared(
+                self.ui.replace(Some(
+                    cbar_launcher::LauncherUi::attach_prepared_with_dismiss(
                         &self.application,
                         crate::Ironbar::runtime().handle(),
                         prepared,
                         display,
-                    )));
+                        on_dismiss,
+                    ),
+                ));
             }
             Some(current) if current.prepare_replacement(&mut prepared) => {
-                let replacement = cbar_launcher::LauncherUi::attach_prepared(
+                let replacement = cbar_launcher::LauncherUi::attach_prepared_with_dismiss(
                     &self.application,
                     crate::Ironbar::runtime().handle(),
                     prepared,
                     display,
+                    on_dismiss,
                 );
                 self.ui.replace(Some(replacement));
                 current.retire();
@@ -239,7 +254,8 @@ impl Launcher {
 
 #[cfg(test)]
 mod tests {
-    use super::PreparationOrder;
+    use super::{PreparationOrder, record_internal_dismiss};
+    use std::cell::Cell;
 
     #[test]
     fn newest_started_preparation_wins_even_when_it_finishes_first() {
@@ -253,5 +269,22 @@ mod tests {
         // Finishing the stale warmup later cannot make it current again.
         assert!(!order.is_current(slow_warm));
         assert!(order.is_current(explicit_show));
+    }
+
+    #[test]
+    fn internal_dismiss_invalidates_inflight_prepare_and_stays_hidden_on_refresh() {
+        let order = PreparationOrder::default();
+        let desired_visible = Cell::new(true);
+        let inflight_prepare = order.begin();
+
+        record_internal_dismiss(&desired_visible, &order);
+        assert!(!desired_visible.get());
+        assert!(!order.is_current(inflight_prepare));
+
+        // A later refresh is allowed to prepare newer state, but it does not change visibility
+        // intent and therefore cannot turn a normal Escape/blur/launch dismissal into a reopen.
+        let refresh = order.begin();
+        assert!(order.is_current(refresh));
+        assert!(!desired_visible.get());
     }
 }

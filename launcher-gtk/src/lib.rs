@@ -47,7 +47,18 @@ use model::*;
 
 type Callback = Rc<dyn Fn()>;
 type CallbackSlot = Rc<RefCell<Option<Callback>>>;
+type WeakCallbackSlot = std::rc::Weak<RefCell<Option<Callback>>>;
 type OutputPreference = Rc<dyn Fn(&[String])>;
+
+fn invalidate_render(holder: &WeakCallbackSlot) {
+    let Some(holder) = holder.upgrade() else {
+        return;
+    };
+    let callback = holder.borrow().as_ref().cloned();
+    if let Some(callback) = callback {
+        callback();
+    }
+}
 
 /// Keep the GTK object tree bounded without deleting any provider/model data. Ordinary Golden
 /// Master inventories fit on one page and are byte-for-byte unchanged; exceptionally large
@@ -654,6 +665,14 @@ pub struct LauncherUi {
     reveal: Rc<dyn Fn()>,
     providers: Rc<RefCell<Option<Rc<provider::ProviderManager>>>>,
     interaction_generation: Rc<Cell<u64>>,
+    /// Own the render callback slot for exactly as long as this UI is live. Widget controllers
+    /// intentionally retain only weak references to the slot, so omitting this owner makes every
+    /// post-build drag, hide and middle-click invalidation silently stop rendering.
+    render_holder: CallbackSlot,
+    /// A complete UI replacement is delayed while launch receipts still belong to this state.
+    /// Otherwise a late receipt can persist an old whole-usage snapshot over launches already
+    /// recorded by the replacement UI.
+    inflight_launches: Rc<RefCell<HashSet<(String, String)>>>,
     source_config: Option<config::Config>,
     icon_identity: Option<(i32, u64)>,
     style_provider: CssProvider,
@@ -695,10 +714,18 @@ struct ReplacementDecision {
 
 fn replacement_decision(
     config_changed: bool,
+    launches_inflight: bool,
     baseline: &MutableStateSnapshot,
     current: &MutableStateSnapshot,
     prepared: &MutableStateSnapshot,
 ) -> ReplacementDecision {
+    if launches_inflight {
+        return ReplacementDecision {
+            rebuild: false,
+            transfer_current: false,
+            advance_baseline: false,
+        };
+    }
     let advance_baseline = prepared == current;
     let external_state_changed = current == baseline && prepared != current;
     let transfer_current = config_changed && current != baseline && prepared != current;
@@ -839,7 +866,20 @@ impl LauncherUi {
         prepared: PreparedLauncher,
         display: &gtk::gdk::Display,
     ) -> Self {
-        build(application, runtime, prepared, display)
+        Self::attach_prepared_with_dismiss(application, runtime, prepared, display, Rc::new(|| {}))
+    }
+
+    /// Attach the embedded launcher and report dismissals initiated inside its own UI. The cbar
+    /// owner uses this to invalidate an in-flight preparation and keep its visibility intent in
+    /// sync after Escape, focus loss, or a successful launch.
+    pub fn attach_prepared_with_dismiss(
+        application: &Application,
+        runtime: &tokio::runtime::Handle,
+        prepared: PreparedLauncher,
+        display: &gtk::gdk::Display,
+        on_dismiss: Rc<dyn Fn()>,
+    ) -> Self {
+        build(application, runtime, prepared, display, on_dismiss)
     }
 
     /// Map the already-built window first; refresh is only a broadcast to independent providers.
@@ -921,6 +961,7 @@ impl LauncherUi {
         let baseline = self.state_baseline.borrow().clone();
         let decision = replacement_decision(
             config_changed || icon_changed,
+            !self.inflight_launches.borrow().is_empty(),
             &baseline,
             &current,
             &prepared_state,
@@ -941,6 +982,7 @@ impl LauncherUi {
     pub fn retire(&self) {
         advance_generation(&self.interaction_generation);
         self.providers.borrow_mut().take();
+        self.render_holder.borrow_mut().take();
         self.window.close();
         gtk::style_context_remove_provider_for_display(&self.display, &self.style_provider);
     }
@@ -1025,6 +1067,7 @@ fn build(
     runtime: &tokio::runtime::Handle,
     prepared: PreparedLauncher,
     display: &gtk::gdk::Display,
+    on_dismiss: Rc<dyn Fn()>,
 ) -> LauncherUi {
     warm_launch_service();
     let source_config = prepared.config.as_ref().ok().and_then(Clone::clone);
@@ -1483,9 +1526,14 @@ fn build(
     let inflight_launches = Rc::new(RefCell::new(HashSet::<(String, String)>::new()));
     let dismiss: Rc<dyn Fn(&ApplicationWindow)> = Rc::new({
         let interaction_generation = interaction_generation.clone();
+        let on_dismiss = on_dismiss.clone();
         move |w: &ApplicationWindow| {
+            if !w.is_visible() {
+                return;
+            }
             advance_generation(&interaction_generation);
             w.set_visible(false);
+            on_dismiss();
         }
     });
 
@@ -1917,11 +1965,7 @@ fn build(
                             // Dropped on the cell's own background, not on a line: give it a
                             // line to itself. Joining an appset is what dropping ON a line means.
                             st.borrow_mut().place_app(c, name, r, None, None);
-                            if let Some(holder) = holder2.upgrade()
-                                && let Some(rf) = holder.borrow().as_ref()
-                            {
-                                rf();
-                            }
+                            invalidate_render(&holder2);
                             true
                         });
                         cell.add_controller(tgt);
@@ -2030,11 +2074,7 @@ fn build(
                                     Some(&names),
                                     before.as_deref(),
                                 );
-                                if let Some(holder) = holder2.upgrade()
-                                    && let Some(rf) = holder.borrow().as_ref()
-                                {
-                                    rf();
-                                }
+                                invalidate_render(&holder2);
                                 true
                             });
                             lb.add_controller(tgt);
@@ -2168,11 +2208,8 @@ fn build(
                                         let changed = state.hide_app(&machine_name, &id);
                                         state.clamp();
                                         drop(state);
-                                        if changed
-                                            && let Some(holder) = holder2.upgrade()
-                                            && let Some(rf) = holder.borrow().as_ref()
-                                        {
-                                            rf();
+                                        if changed {
+                                            invalidate_render(&holder2);
                                         }
                                         return;
                                     }
@@ -2236,11 +2273,7 @@ fn build(
                                                 }
                                                 state.rebuild();
                                                 drop(state);
-                                                if let Some(holder) = holder.upgrade()
-                                                    && let Some(render) = holder.borrow().as_ref()
-                                                {
-                                                    render();
-                                                }
+                                                invalidate_render(&holder);
                                             } else {
                                                 drop(state);
                                                 if current {
@@ -2709,6 +2742,8 @@ fn build(
         reveal,
         providers,
         interaction_generation,
+        render_holder,
+        inflight_launches,
         source_config,
         icon_identity,
         style_provider: provider,
@@ -3607,7 +3642,7 @@ mod tests {
         let unreadable = mutable_snapshot(false);
         let repaired = mutable_snapshot(true);
         assert_eq!(
-            replacement_decision(false, &unreadable, &unreadable, &repaired),
+            replacement_decision(false, false, &unreadable, &unreadable, &repaired),
             ReplacementDecision {
                 rebuild: true,
                 transfer_current: false,
@@ -3623,27 +3658,89 @@ mod tests {
             .entry("arbitrary".into())
             .or_default()
             .insert("external-app".into());
-        assert!(replacement_decision(false, &baseline, &baseline, &external).rebuild);
+        assert!(replacement_decision(false, false, &baseline, &baseline, &external).rebuild);
 
         let mut live = baseline.clone();
         live.visibility
             .entry("arbitrary".into())
             .or_default()
             .insert("just-hidden".into());
-        let pending = replacement_decision(true, &baseline, &live, &baseline);
+        let pending = replacement_decision(true, false, &baseline, &live, &baseline);
         assert!(pending.rebuild);
         assert!(
             pending.transfer_current,
             "a pending async save must be transferred into a config rebuild"
         );
         assert!(
-            !replacement_decision(false, &baseline, &live, &baseline).rebuild,
+            !replacement_decision(false, false, &baseline, &live, &baseline).rebuild,
             "an unchanged config must retain unsaved live state rather than reload stale disk"
         );
 
-        let caught_up = replacement_decision(false, &baseline, &live, &live);
+        let caught_up = replacement_decision(false, false, &baseline, &live, &live);
         assert!(!caught_up.rebuild);
         assert!(caught_up.advance_baseline);
+    }
+
+    #[test]
+    fn inflight_launch_defers_replacement_then_clean_refresh_adopts_saved_usage() {
+        let baseline = mutable_snapshot(true);
+        let prepared_before_receipt = baseline.clone();
+        let deferred =
+            replacement_decision(true, true, &baseline, &baseline, &prepared_before_receipt);
+        assert_eq!(
+            deferred,
+            ReplacementDecision {
+                rebuild: false,
+                transfer_current: false,
+                advance_baseline: false,
+            },
+            "a replacement must not split ownership of a pending launch receipt"
+        );
+
+        let mut completed = baseline.clone();
+        completed.usage.insert(
+            usage::key("machine", "completed-app"),
+            usage::Entry {
+                score: 1.0,
+                last: 1,
+            },
+        );
+        let refreshed = replacement_decision(true, false, &baseline, &completed, &completed);
+        assert!(refreshed.rebuild);
+        assert!(!refreshed.transfer_current);
+        assert!(refreshed.advance_baseline);
+        assert_eq!(
+            completed
+                .usage
+                .get(&usage::key("machine", "completed-app"))
+                .map(|entry| entry.score),
+            Some(1.0),
+            "the next clean refresh carries the persisted launch into the replacement"
+        );
+    }
+
+    #[test]
+    fn retained_render_holder_services_post_build_invalidations_until_retire() {
+        let renders = Rc::new(Cell::new(0usize));
+        let holder: CallbackSlot = Rc::new(RefCell::new(None));
+        let weak = Rc::downgrade(&holder);
+        *holder.borrow_mut() = Some(Rc::new({
+            let renders = renders.clone();
+            move || renders.set(renders.get() + 1)
+        }));
+
+        // This is the ownership shape returned by `build`: controllers retain `weak`, while
+        // LauncherUi retains `holder` after the constructor's local variables have gone away.
+        invalidate_render(&weak);
+        assert_eq!(renders.get(), 1);
+
+        holder.borrow_mut().take();
+        invalidate_render(&weak);
+        assert_eq!(
+            renders.get(),
+            1,
+            "retirement clears the callback before stale controllers can invalidate it"
+        );
     }
 
     #[test]
