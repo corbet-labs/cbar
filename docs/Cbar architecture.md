@@ -10,6 +10,23 @@ Ironbar configuration is parsed by the same configuration types. Cbar-specific
 features extend those types. There is no second legacy parser and no generated
 compatibility configuration.
 
+## Portability invariant
+
+Cbar is a public desktop component for arbitrary Linux systems, not a compiled
+copy of one operator's desktop. The public runtime contains no assumptions
+about host names, CPU count, machine count, interface names, output models,
+hardware vendors, Nix store paths or a particular fleet topology.
+
+Opinionated means that interaction, layout priorities and failure behaviour
+have strong defaults. Hardware and deployment remain capability driven. Tokio
+keeps its platform-derived scheduler defaults unless cross-machine benchmarks
+justify a portable policy; one workstation's thread count is not such a
+benchmark.
+
+Nixdesktop and a private `desktop.nix` may supply personal policy, but cbar also
+builds and runs without Nix. Public tests exercise absent, minimal and multiple
+devices, arbitrary provider names and small through large machine sets.
+
 ## First release boundary
 
 The first release owns:
@@ -137,6 +154,8 @@ A release is blocked unless:
 - Scroll layout and favourite-workspace regressions pass without a live session;
 - per-machine launcher isolation, offline startup and recovery tests pass;
 - graph parsers pass against injected procfs/sysfs fixtures;
+- synthetic fixtures cover no accelerators, multiple vendors and devices,
+  arbitrary network names and different CPU topologies;
 - narrow and wide layout snapshots preserve priority and readability;
 - IPC and state-file permission tests pass; and
 - idle CPU, resident memory, startup latency and redraw counts are recorded
