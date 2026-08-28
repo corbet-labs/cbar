@@ -302,6 +302,9 @@ wait_for_status visible "resident show"
 wait_for_counter_above count_preparation_finishes "$prepare_before" "show preparation"
 wait_for_counter_above count_launcher_maps 0 "first launcher map"
 first_maps=$(count_launcher_maps)
+# Layer-shell focus is granted after the map/configure round trip, not when IPC first reports the
+# GTK visibility flag. Give that protocol transition one bounded beat before injecting Escape.
+sleep 0.5
 
 # Escape is handled inside the launcher window. It must also update the outer resident owner's
 # desired state; otherwise the next completed async preparation maps the window behind the user's
