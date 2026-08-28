@@ -109,7 +109,10 @@ fn run_with_args() {
 
             let rt = create_runtime();
             rt.block_on(async move {
-                let ipc = ipc::Ipc::new();
+                let ipc = ipc::Ipc::new().unwrap_or_else(|err| {
+                    error!("{err:#}");
+                    exit(ExitCode::IpcResponseError as i32)
+                });
                 match ipc.send(command, args.debug).await {
                     Ok(res) => {
                         if args.debug {
@@ -223,7 +226,10 @@ impl Ironbar {
 
             cfg_if! {
                 if #[cfg(feature = "ipc")] {
-                    let ipc = ipc::Ipc::new();
+                    let ipc = ipc::Ipc::new().unwrap_or_else(|err| {
+                        error!("{err:#}");
+                        exit(ExitCode::IpcResponseError as i32)
+                    });
                     ipc.start(app, instance.clone());
                 }
             }
