@@ -1,0 +1,143 @@
+# Cbar architecture
+
+Cbar is an opinionated Rust/GTK4 desktop panel derived from Ironbar. It keeps
+Ironbar's configuration model and module behaviour as a directly maintained
+superset while integrating the launcher and the native system graphs into the
+same runtime.
+
+The compatibility promise is source-level, not a translation layer: supported
+Ironbar configuration is parsed by the same configuration types. Cbar-specific
+features extend those types. There is no second legacy parser and no generated
+compatibility configuration.
+
+## First release boundary
+
+The first release owns:
+
+- the GTK layer-shell panel;
+- the application launcher;
+- native system and network graphs;
+- typed compositor integration, including Scroll's layout aliases; and
+- a local control socket for reveal, hide and other panel actions.
+
+The compositor, notification daemon, OSD and lock screen remain separate
+processes. Their integration is expressed through narrow providers so they can
+be replaced independently. In particular, replacing SwayNC is a future clean
+cut after notification-spec parity; cbar must not run a partial notification
+daemon alongside it.
+
+## Runtime model
+
+GTK widgets and their mutable presentation state live on the GTK main thread.
+Blocking file, process, compositor and network work never runs there. Async
+providers publish bounded state updates; presentation code consumes the newest
+complete update and is allowed to discard obsolete intermediate samples.
+
+Provider failures are local. A failed graph source, remote machine or
+compositor subscription must not terminate the panel or stall unrelated
+providers. Tasks are supervised and restarted with bounded exponential backoff.
+
+Launched applications are not children whose lifetime or sandbox is inherited
+from cbar. The launcher hands them to a transient user service so restarting or
+hardening cbar cannot terminate or accidentally restrict applications.
+
+## Offline-first launcher
+
+Opening, searching and launching local applications never waits for a network
+operation. The first frame uses local inventory plus independently stored
+last-known-good inventories for remote machines.
+
+Each remote machine is a separate asynchronous provider with its own:
+
+- timeout;
+- connection and refresh task;
+- last-known-good inventory;
+- failure count and backoff deadline; and
+- recovery lifecycle.
+
+Results are opportunistic. A response from one machine is merged as soon as it
+arrives. A slow or unreachable machine does not delay local results or any other
+machine and does not produce a global spinner, modal error or blocking empty
+state. Fresh results must not reset the query, keyboard focus, selected item or
+scroll position. Stable keys and ordering prevent rows from jumping while the
+user is navigating.
+
+The provider contract is tested with a controllable clock and fake transports:
+one machine times out while another succeeds, the launcher remains immediately
+usable, cached data remains available, and the failed machine can recover on a
+later attempt.
+
+## Native graphs
+
+System graphs use one Rust sampler and one GTK4/Cairo drawing surface. They do
+not spawn a shell or enter Lua for every source and frame. Sampling cadence and
+drawing cadence are independent: an unchanged or hidden graph does not force a
+new sample or redraw.
+
+Graph priority is:
+
+1. CPU
+2. RAM
+3. swap
+4. storage I/O
+5. VPU media encode/decode
+6. GPU
+7. NPU
+8. primary wired network
+9. WLAN
+10. WWAN
+11. WireGuard/Netbird VPN
+
+Only available sources are shown. The layout first compresses history within a
+readable lower bound and only then removes the lowest-priority visible graph.
+It restores graphs in priority order when space returns. Multiple interfaces in
+one network class rotate without attention-grabbing motion; totals and tooltips
+identify the active interface.
+
+RAM displays reclaimable headroom rather than treating the kernel's page cache
+as irreversibly occupied. Network graphs preserve direction and rate units.
+Hardware-specific probes are capability driven and remain dormant on machines
+without that hardware.
+
+## Compositor integration
+
+Scroll support belongs at the typed swayipc boundary. Horizontal and vertical
+layout aliases are accepted by the dependency's node-layout type. Cbar does not
+ship an IPC proxy or rewrite raw protocol messages.
+
+Favourite workspaces are native cbar state: a missing favourite can be created
+and focused by name, and an empty workspace event cannot silently remove its
+button. These behaviours have protocol-fixture tests and require no live
+compositor connection.
+
+## Security boundary
+
+The local control socket is created with user-only permissions and verifies the
+peer user. Persistent launcher state is atomic, mode `0600`, size bounded and
+opened without following symlinks. Desktop entries become argument vectors;
+they are never interpolated into a shell command.
+
+The opinionated build excludes arbitrary Lua and script execution unless the
+operator explicitly enables the upstream-compatible features. Runtime
+hardening is applied to cbar itself, not inherited by launched applications.
+
+## Configuration ownership
+
+Cbar owns executable UI mechanisms. Nixdesktop owns reusable Home Manager and
+systemd policy. A machine's private `desktop.nix` supplies values and hardware
+capabilities. Network, audio, GPU, remote-host and compositor modules remain the
+authorities for their respective data; cbar consumes typed state and actions
+instead of duplicating policy.
+
+## Release gates
+
+A release is blocked unless:
+
+- upstream Ironbar configuration fixtures still parse and render;
+- Scroll layout and favourite-workspace regressions pass without a live session;
+- per-machine launcher isolation, offline startup and recovery tests pass;
+- graph parsers pass against injected procfs/sysfs fixtures;
+- narrow and wide layout snapshots preserve priority and readability;
+- IPC and state-file permission tests pass; and
+- idle CPU, resident memory, startup latency and redraw counts are recorded
+  against the previous release.
