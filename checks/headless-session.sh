@@ -43,7 +43,7 @@ command_exists "${COMPOSITOR_ARGV[0]}" || {
     printf 'no compositor: %s\n' "${COMPOSITOR_ARGV[0]}" >&2
     exit 2
 }
-for dependency in bash dbus-run-session python3 setsid; do
+for dependency in bash dbus-run-session ps python3 setsid; do
     command_exists "$dependency" || { printf 'missing dependency: %s\n' "$dependency" >&2; exit 2; }
 done
 
@@ -189,6 +189,22 @@ process_group_alive() {
     [[ $group =~ ^[1-9][0-9]*$ ]] && kill -0 -- "-$group" 2>/dev/null
 }
 
+assert_session_leader() {
+    local pid=$1
+    local label=$2
+    local group=
+    local session=
+    for _ in $(seq 1 40); do
+        group=
+        session=
+        read -r group session < <(ps -o pgid= -o sid= -p "$pid") || true
+        [[ $pid == "$group" && $pid == "$session" ]] && return 0
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.01
+    done
+    fail "$label was not an owned session leader (pid=$pid pgid=${group:-none} sid=${session:-none})"
+}
+
 reap_if_exited() {
     local pid=${1:-}
     [[ $pid =~ ^[1-9][0-9]*$ ]] || return 0
@@ -281,6 +297,7 @@ unset HOME WAYLAND_DISPLAY WAYLAND_SOCKET SWAYSOCK SCROLLSOCK I3SOCK NIRI_SOCKET
 
 setsid -- "${compositor[@]}" >"$rig/compositor.log" 2>&1 &
 compositor_pid=$!
+assert_session_leader "$compositor_pid" "compositor"
 
 wayland_display=
 for _ in $(seq 1 150); do
@@ -301,6 +318,7 @@ export WAYLAND_DISPLAY=$wayland_display
 # a one-shot injector created only after map can disappear before that seat transition is applied.
 setsid -- "$input_driver" -P Shift_L -p Shift_L -s 180000 >"$rig/input-keeper.log" 2>&1 &
 input_keeper_pid=$!
+assert_session_leader "$input_keeper_pid" "input keeper"
 sleep 0.1
 process_group_alive "$input_keeper_pid" || fail "input driver could not keep a virtual keyboard alive"
 
@@ -312,6 +330,7 @@ IRONBAR_CONFIG="$rig/bar.toml" \
 IRONBAR_CSS="$rig/bar.css" \
 setsid -- "$cbar" >"$rig/cbar.log" 2>&1 &
 bar_pid=$!
+assert_session_leader "$bar_pid" "cbar"
 
 for _ in $(seq 1 150); do
     [[ -S $rig/ironbar-ipc.sock ]] && break
@@ -389,6 +408,7 @@ cancel_before=$(count_cancel_keys)
 process_group_alive "$input_keeper_pid" || fail "virtual keyboard keeper exited before Escape"
 setsid -- "$input_driver" -P Escape -s 50 -p Escape >"$rig/input-injector.log" 2>&1 &
 input_injector_pid=$!
+assert_session_leader "$input_injector_pid" "input injector"
 if wait_for_process "$input_injector_pid" "Escape input"; then
     input_status=0
 else
