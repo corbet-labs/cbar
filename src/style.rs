@@ -1,10 +1,12 @@
 use crate::channels::MpscReceiverExt;
 use crate::file_watch;
+use crate::spawn;
 use gtk::ffi::GTK_STYLE_PROVIDER_PRIORITY_USER;
 use gtk::{CssProvider, gio};
 use std::env;
 use std::path::PathBuf;
-use tracing::{debug, info};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 #[derive(Debug)]
 pub enum CssSource {
@@ -51,12 +53,31 @@ pub fn load_css(source: &CssSource) {
 
     // install file watcher
     if let Some(style_path) = path {
-        let rx = file_watch::subscribe(&style_path).expect("Failed to start CSS file watcher");
-        debug!("Installed CSS file watcher on '{}'", style_path.display());
-
-        rx.recv_glib((), move |(), ()| {
-            info!("Reloading CSS");
-            provider.load_from_file(&gio::File::for_path(&style_path));
+        let (reload_tx, reload_rx) = mpsc::channel(1);
+        let watch_path = style_path.clone();
+        spawn(async move {
+            match file_watch::subscribe(&watch_path).await {
+                Ok(mut changes) => {
+                    debug!("Installed CSS file watcher on '{}'", watch_path.display());
+                    while changes.recv().await.is_some() {
+                        if reload_tx.send(()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(err) => warn!(
+                    "CSS hot reload unavailable for '{}': {err}",
+                    watch_path.display()
+                ),
+            }
         });
+
+        reload_rx.recv_glib(
+            (&provider, &style_path),
+            move |(provider, style_path), ()| {
+                info!("Reloading CSS");
+                provider.load_from_file(&gio::File::for_path(style_path));
+            },
+        );
     }
 }

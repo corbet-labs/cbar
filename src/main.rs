@@ -21,7 +21,9 @@ use smithay_client_toolkit::output::OutputInfo;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot::Sender;
 use tokio::task::{JoinHandle, block_in_place};
-use tracing::{debug, error, info, warn};
+#[cfg(feature = "ipc")]
+use tracing::warn;
+use tracing::{debug, error, info};
 
 use crate::bar::{Bar, create_bar};
 use crate::channels::SyncSenderExt;

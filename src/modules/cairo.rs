@@ -13,7 +13,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
-use tracing::error;
+use tracing::{error, warn};
 
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "extras", derive(schemars::JsonSchema))]
@@ -129,10 +129,14 @@ impl Module<gtk::Box> for CairoModule {
         let path = self.path();
 
         let tx = context.tx.clone();
-        let mut changes = file_watch::subscribe(path).expect("Failed to start lua file watcher");
         spawn(async move {
-            while changes.recv().await.is_some() {
-                tx.send_update(()).await;
+            match file_watch::subscribe(&path).await {
+                Ok(mut changes) => {
+                    while changes.recv().await.is_some() {
+                        tx.send_update(()).await;
+                    }
+                }
+                Err(err) => warn!("Lua hot reload unavailable for '{}': {err}", path.display()),
             }
         });
 

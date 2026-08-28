@@ -23,8 +23,15 @@ static SERVICE_INIT: Mutex<()> = Mutex::new(());
 /// All subscriptions in the process share one platform watcher. The returned
 /// channel has capacity for one pending notification, so filesystem event
 /// bursts are coalesced until the consumer catches up.
-pub fn subscribe(path: impl AsRef<Path>) -> notify::Result<mpsc::Receiver<()>> {
-    service()?.subscribe(path.as_ref())
+pub async fn subscribe(path: impl AsRef<Path>) -> notify::Result<mpsc::Receiver<()>> {
+    let path = path.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || subscribe_blocking(&path))
+        .await
+        .map_err(|_| notify::Error::generic("file watch subscription worker stopped"))?
+}
+
+fn subscribe_blocking(path: &Path) -> notify::Result<mpsc::Receiver<()>> {
+    service()?.subscribe(path)
 }
 
 fn service() -> notify::Result<&'static FileWatchService> {
