@@ -7,16 +7,18 @@
 
 use crate::spawn;
 use serde::Deserialize;
+use std::ffi::OsString;
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::Instant;
 use tracing::{info, trace, warn};
 
 const IPC_MAGIC: &[u8; 6] = b"i3-ipc";
@@ -26,6 +28,7 @@ const EVENT_BIT: u32 = 1 << 31;
 const RUN_COMMAND: u32 = 0;
 const GET_WORKSPACES: u32 = 1;
 const SUBSCRIBE: u32 = 2;
+const GET_BINDING_STATE: u32 = 12;
 const GET_INPUTS: u32 = 100;
 const WORKSPACE_EVENT: u32 = EVENT_BIT;
 const MODE_EVENT: u32 = EVENT_BIT | 2;
@@ -34,9 +37,13 @@ const RECONNECT_INITIAL: Duration = Duration::from_millis(100);
 const RECONNECT_MAX: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const SUBSCRIPTION_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const LISTENER_MAINTENANCE: Duration = Duration::from_secs(1);
+const LISTENER_QUEUE_CAPACITY: usize = 64;
+const EVENT_QUEUE_CAPACITY: usize = 64;
 
 type Result<T> = std::result::Result<T, Error>;
-type SyncFn<T> = dyn Fn(&T) + Sync + Send;
+type SyncFn<T> = dyn Fn(&T) -> bool + Sync + Send;
+type AliveFn = dyn Fn() -> bool + Sync + Send;
 type ConnectFuture = Pin<Box<dyn Future<Output = Result<Connection>> + Send>>;
 type Connector = Arc<dyn Fn() -> ConnectFuture + Send + Sync>;
 
@@ -45,7 +52,7 @@ impl<T> AsyncIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("SWAYSOCK is not set")]
+    #[error("neither SWAYSOCK nor I3SOCK is set")]
     MissingSocket,
     #[error("failed to connect to Sway IPC socket {path:?}: {source}")]
     Connect {
@@ -160,6 +167,24 @@ pub struct ModeEvent {
     pub pango_markup: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceMessage {
+    Snapshot(Vec<Workspace>),
+    Event(WorkspaceEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputMessage {
+    Snapshot(Vec<Input>),
+    Event(InputEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModeMessage {
+    Snapshot(ModeEvent),
+    Event(ModeEvent),
+}
+
 #[derive(Debug)]
 struct Frame {
     message_type: u32,
@@ -171,6 +196,16 @@ enum Event {
     Workspace(WorkspaceEvent),
     Input(InputEvent),
     Mode(ModeEvent),
+}
+
+impl Event {
+    const fn event_type(&self) -> EventType {
+        match self {
+            Self::Workspace(_) => EventType::Workspace,
+            Self::Input(_) => EventType::Input,
+            Self::Mode(_) => EventType::Mode,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +297,12 @@ impl Connection {
         decode_json(&payload, "input response")
     }
 
+    pub(crate) async fn get_binding_state(&mut self) -> Result<String> {
+        let payload = transact(&mut self.io, GET_BINDING_STATE, &[]).await?;
+        let state: BindingState = decode_json(&payload, "binding state response")?;
+        Ok(state.name)
+    }
+
     async fn subscribe(&mut self, event_types: &[EventType]) -> Result<()> {
         let names = event_types
             .iter()
@@ -304,7 +345,15 @@ impl std::fmt::Debug for RequestConnection {
 }
 
 impl RequestConnection {
-    fn new(current: Connection, connect: Connector) -> Self {
+    fn new(connect: Connector) -> Self {
+        Self {
+            current: None,
+            connect,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_current(current: Connection, connect: Connector) -> Self {
         Self {
             current: Some(current),
             connect,
@@ -388,6 +437,28 @@ impl RequestConnection {
         self.finish_request(result)
     }
 
+    pub(crate) async fn get_binding_state(&mut self) -> Result<String> {
+        self.get_binding_state_with_timeout(REQUEST_TIMEOUT).await
+    }
+
+    async fn get_binding_state_with_timeout(
+        &mut self,
+        request_timeout: Duration,
+    ) -> Result<String> {
+        let result = match tokio::time::timeout(request_timeout, async {
+            self.ensure_connected().await?.get_binding_state().await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(Error::RequestTimeout {
+                operation: "binding state request",
+                millis: request_timeout.as_millis(),
+            }),
+        };
+        self.finish_request(result)
+    }
+
     fn finish_request<T>(&mut self, result: Result<T>) -> Result<T> {
         if result.as_ref().is_err_and(Error::breaks_request_connection) {
             // Never retry the operation that just failed: a command may have
@@ -407,19 +478,6 @@ impl Error {
 
 fn socket_connector() -> Connector {
     Arc::new(|| Box::pin(Connection::new()))
-}
-
-async fn connect_with_timeout(
-    connect: &Connector,
-    connection_timeout: Duration,
-    operation: &'static str,
-) -> Result<Connection> {
-    tokio::time::timeout(connection_timeout, connect())
-        .await
-        .map_err(|_| Error::RequestTimeout {
-            operation,
-            millis: connection_timeout.as_millis(),
-        })?
 }
 
 async fn connect_and_subscribe_with_timeout(
@@ -455,47 +513,20 @@ struct SubscriptionOutcome {
     error: Option<String>,
 }
 
-#[derive(Default)]
-struct Listeners {
-    workspaces: Vec<Arc<SyncFn<WorkspaceEvent>>>,
-    inputs: Vec<Arc<SyncFn<InputEvent>>>,
-    modes: Vec<Arc<SyncFn<ModeEvent>>>,
+#[derive(Debug, Deserialize)]
+struct BindingState {
+    name: String,
 }
 
-impl Listeners {
-    fn push(&mut self, listener: Listener) {
-        match listener {
-            Listener::Workspace(listener) => self.workspaces.push(listener),
-            Listener::Input(listener) => self.inputs.push(listener),
-            Listener::Mode(listener) => self.modes.push(listener),
-        }
-    }
-
-    fn dispatch(&self, event: &Event) {
-        match event {
-            Event::Workspace(event) => {
-                for listener in &self.workspaces {
-                    listener(event);
-                }
-            }
-            Event::Input(event) => {
-                for listener in &self.inputs {
-                    listener(event);
-                }
-            }
-            Event::Mode(event) => {
-                for listener in &self.modes {
-                    listener(event);
-                }
-            }
-        }
-    }
+struct ListenerEntry<T> {
+    alive: Arc<AliveFn>,
+    callback: Arc<SyncFn<T>>,
 }
 
 enum Listener {
-    Workspace(Arc<SyncFn<WorkspaceEvent>>),
-    Input(Arc<SyncFn<InputEvent>>),
-    Mode(Arc<SyncFn<ModeEvent>>),
+    Workspace(ListenerEntry<WorkspaceMessage>),
+    Input(ListenerEntry<InputMessage>),
+    Mode(ListenerEntry<ModeMessage>),
 }
 
 impl Listener {
@@ -506,11 +537,68 @@ impl Listener {
             Self::Mode(_) => EventType::Mode,
         }
     }
+
+    fn is_alive(&self) -> bool {
+        match self {
+            Self::Workspace(listener) => (listener.alive)(),
+            Self::Input(listener) => (listener.alive)(),
+            Self::Mode(listener) => (listener.alive)(),
+        }
+    }
+
+    fn dispatch_event(&self, event: &Event) -> bool {
+        if !self.is_alive() {
+            return false;
+        }
+
+        match (self, event) {
+            (Self::Workspace(listener), Event::Workspace(event)) => {
+                (listener.callback)(&WorkspaceMessage::Event(event.clone()))
+            }
+            (Self::Input(listener), Event::Input(event)) => {
+                (listener.callback)(&InputMessage::Event(event.clone()))
+            }
+            (Self::Mode(listener), Event::Mode(event)) => {
+                (listener.callback)(&ModeMessage::Event(event.clone()))
+            }
+            _ => true,
+        }
+    }
+
+    fn dispatch_snapshot(&self, snapshot: &Snapshot) -> bool {
+        if !self.is_alive() {
+            return false;
+        }
+
+        match (self, snapshot) {
+            (Self::Workspace(listener), Snapshot::Workspace(workspaces)) => {
+                (listener.callback)(&WorkspaceMessage::Snapshot(workspaces.clone()))
+            }
+            (Self::Input(listener), Snapshot::Input(inputs)) => {
+                (listener.callback)(&InputMessage::Snapshot(inputs.clone()))
+            }
+            (Self::Mode(listener), Snapshot::Mode(mode)) => {
+                (listener.callback)(&ModeMessage::Snapshot(mode.clone()))
+            }
+            _ => true,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Snapshot {
+    Workspace(Vec<Workspace>),
+    Input(Vec<Input>),
+    Mode(ModeEvent),
+}
+
+struct SupervisorHandle {
+    registrations: mpsc::Sender<Listener>,
+    join_handle: tokio::task::JoinHandle<()>,
 }
 
 struct TaskState {
-    join_handles: [Option<tokio::task::JoinHandle<()>>; 3],
-    listeners: Arc<RwLock<Listeners>>,
+    supervisors: [Option<SupervisorHandle>; 3],
 }
 
 pub struct Client {
@@ -531,18 +619,27 @@ impl std::fmt::Debug for Client {
 impl Client {
     pub(crate) async fn new() -> Result<Self> {
         let connect = socket_connector();
-        let current = connect_with_timeout(&connect, REQUEST_TIMEOUT, "initial connection").await?;
-        let connection = Arc::new(Mutex::new(RequestConnection::new(current, connect.clone())));
-        info!("Sway IPC request client connected");
+        let connection = Arc::new(Mutex::new(RequestConnection::new(connect.clone())));
+        info!("Sway IPC client initialised");
 
         Ok(Self {
             connection,
             task_state: Mutex::new(TaskState {
-                listeners: Arc::new(RwLock::new(Listeners::default())),
-                join_handles: [None, None, None],
+                supervisors: [None, None, None],
             }),
             connect,
         })
+    }
+
+    #[cfg(test)]
+    fn with_connector(connect: Connector) -> Self {
+        Self {
+            connection: Arc::new(Mutex::new(RequestConnection::new(connect.clone()))),
+            task_state: Mutex::new(TaskState {
+                supervisors: [None, None, None],
+            }),
+            connect,
+        }
     }
 
     pub(crate) fn connection(&self) -> &Arc<Mutex<RequestConnection>> {
@@ -551,143 +648,332 @@ impl Client {
 
     pub async fn add_workspace_listener(
         &self,
-        listener: impl Fn(&WorkspaceEvent) + Sync + Send + 'static,
+        alive: impl Fn() -> bool + Sync + Send + 'static,
+        listener: impl Fn(&WorkspaceMessage) -> bool + Sync + Send + 'static,
     ) -> Result<()> {
-        self.add_listener(Listener::Workspace(Arc::new(listener)))
-            .await
+        self.add_listener(Listener::Workspace(ListenerEntry {
+            alive: Arc::new(alive),
+            callback: Arc::new(listener),
+        }))
+        .await
     }
 
     pub async fn add_input_listener(
         &self,
-        listener: impl Fn(&InputEvent) + Sync + Send + 'static,
+        alive: impl Fn() -> bool + Sync + Send + 'static,
+        listener: impl Fn(&InputMessage) -> bool + Sync + Send + 'static,
     ) -> Result<()> {
-        self.add_listener(Listener::Input(Arc::new(listener))).await
+        self.add_listener(Listener::Input(ListenerEntry {
+            alive: Arc::new(alive),
+            callback: Arc::new(listener),
+        }))
+        .await
     }
 
     pub async fn add_mode_listener(
         &self,
-        listener: impl Fn(&ModeEvent) + Sync + Send + 'static,
+        alive: impl Fn() -> bool + Sync + Send + 'static,
+        listener: impl Fn(&ModeMessage) -> bool + Sync + Send + 'static,
     ) -> Result<()> {
-        self.add_listener(Listener::Mode(Arc::new(listener))).await
+        self.add_listener(Listener::Mode(ListenerEntry {
+            alive: Arc::new(alive),
+            callback: Arc::new(listener),
+        }))
+        .await
     }
 
-    async fn add_listener(&self, listener: Listener) -> Result<()> {
-        let mut state = self.task_state.lock().await;
+    async fn add_listener(&self, mut listener: Listener) -> Result<()> {
         let event_type = listener.event_type();
-        state
-            .listeners
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(listener);
 
-        // One durable subscription per event type is enough for every bar
-        // output. Adding another listener of that type only extends the shared
-        // callback list; it never tears down a healthy subscription.
-        if state.join_handles[event_type.index()]
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished())
-        {
-            return Ok(());
-        }
-        let event_types = vec![event_type];
+        loop {
+            let registrations = {
+                let mut state = self.task_state.lock().await;
+                if let Some(supervisor) = state.supervisors[event_type.index()].as_ref()
+                    && !supervisor.join_handle.is_finished()
+                {
+                    supervisor.registrations.clone()
+                } else {
+                    if let Some(supervisor) = state.supervisors[event_type.index()].take() {
+                        supervisor.join_handle.abort();
+                    }
+                    let (registrations, registration_rx) = mpsc::channel(LISTENER_QUEUE_CAPACITY);
+                    let join_handle = spawn(subscription_supervisor(
+                        event_type,
+                        registration_rx,
+                        self.connection.clone(),
+                        self.connect.clone(),
+                        RECONNECT_INITIAL,
+                        SUBSCRIPTION_ACK_TIMEOUT,
+                        LISTENER_MAINTENANCE,
+                    ));
+                    state.supervisors[event_type.index()] = Some(SupervisorHandle {
+                        registrations: registrations.clone(),
+                        join_handle,
+                    });
+                    registrations
+                }
+            };
 
-        // Bound the initial handshake. Failure creates an idle supervisor for
-        // this type; subscriptions for the other event types remain untouched.
-        let connection = match connect_and_subscribe_with_timeout(
-            &self.connect,
-            &event_types,
-            SUBSCRIPTION_ACK_TIMEOUT,
-        )
-        .await
-        {
-            Ok(connection) => Some(connection),
-            Err(error) => {
-                // Listener registration is local and durable for this Client.
-                // A missing acknowledgement starts the same bounded reconnect
-                // lifecycle used after EOF instead of hanging or panicking the
-                // module that registered it.
-                warn!(?error, "Sway IPC subscription will reconnect in background");
-                None
+            match registrations.send(listener).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    listener = error.0;
+                    let mut state = self.task_state.lock().await;
+                    if state.supervisors[event_type.index()]
+                        .as_ref()
+                        .is_some_and(|supervisor| supervisor.registrations.is_closed())
+                    {
+                        if let Some(supervisor) = state.supervisors[event_type.index()].take() {
+                            supervisor.join_handle.abort();
+                        }
+                    }
+                }
             }
-        };
-
-        let shared_listeners = state.listeners.clone();
-        state.join_handles[event_type.index()] = Some(spawn(subscription_loop(
-            connection,
-            event_types,
-            shared_listeners,
-            self.connect.clone(),
-            RECONNECT_INITIAL,
-            SUBSCRIPTION_ACK_TIMEOUT,
-        )));
-        Ok(())
+        }
     }
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
-        for handle in &mut self.task_state.get_mut().join_handles {
-            if let Some(handle) = handle.take() {
-                handle.abort();
+        for supervisor in &mut self.task_state.get_mut().supervisors {
+            if let Some(supervisor) = supervisor.take() {
+                supervisor.join_handle.abort();
             }
         }
     }
 }
 
-async fn subscription_loop(
-    mut connection: Option<Connection>,
-    event_types: Vec<EventType>,
-    listeners: Arc<RwLock<Listeners>>,
+async fn subscription_supervisor(
+    event_type: EventType,
+    mut registrations: mpsc::Receiver<Listener>,
+    request_connection: Arc<Mutex<RequestConnection>>,
     connect: Connector,
     initial_retry: Duration,
     acknowledgement_timeout: Duration,
+    maintenance_period: Duration,
 ) {
-    let mut retry = initial_retry;
+    let mut listeners = Vec::new();
+    let mut event_rx = None;
+    let mut event_reader = None;
+    let mut reconnect_retry = initial_retry;
+    let mut next_connect = Instant::now();
+    let mut snapshot_retry = initial_retry;
+    let mut snapshot_due = None;
+    let mut maintenance = tokio::time::interval(maintenance_period);
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
-        if let Some(active) = connection.as_mut() {
-            match active.next_event().await {
-                Ok(Some(event)) => {
-                    trace!(?event, "Sway IPC event");
-                    listeners
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .dispatch(&event);
-                    retry = initial_retry;
-                    continue;
+        listeners.retain(Listener::is_alive);
+
+        if listeners.is_empty() {
+            stop_event_reader(&mut event_reader, &mut event_rx);
+            snapshot_due = None;
+            reconnect_retry = initial_retry;
+            snapshot_retry = initial_retry;
+
+            match registrations.recv().await {
+                Some(listener) if listener.is_alive() => {
+                    listeners.push(listener);
+                    next_connect = Instant::now();
                 }
-                Ok(None) => {
-                    trace!("ignoring unsupported Sway IPC event");
-                    continue;
-                }
-                Err(Error::InvalidJson { context, source }) => {
-                    // The complete frame has already been consumed, so malformed
-                    // data for one known event cannot desynchronise later frames.
-                    warn!(?source, context, "ignoring malformed Sway IPC event");
-                    continue;
-                }
-                Err(error) => warn!(?error, "Sway IPC subscription disconnected"),
+                Some(_) => {}
+                None => return,
             }
-            drop(connection.take());
+            continue;
         }
 
-        loop {
-            tokio::time::sleep(retry).await;
+        if event_rx.is_none() && Instant::now() >= next_connect {
             match connect_and_subscribe_with_timeout(
                 &connect,
-                &event_types,
+                &[event_type],
                 acknowledgement_timeout,
             )
             .await
             {
-                Ok(next) => {
-                    info!("Sway IPC subscription reconnected");
-                    connection = Some(next);
-                    retry = initial_retry;
-                    break;
+                Ok(connection) => {
+                    info!(?event_type, "Sway IPC subscription connected");
+                    let (event_tx, events) = mpsc::channel(EVENT_QUEUE_CAPACITY);
+                    event_reader = Some(spawn(event_reader_loop(connection, event_type, event_tx)));
+                    event_rx = Some(events);
+                    reconnect_retry = initial_retry;
+
+                    match read_snapshot(event_type, &request_connection).await {
+                        Ok(snapshot) => {
+                            dispatch_snapshot(&mut listeners, &snapshot);
+                            snapshot_due = None;
+                            snapshot_retry = initial_retry;
+                        }
+                        Err(error) => {
+                            warn!(?error, ?event_type, "Sway IPC initial snapshot failed");
+                            snapshot_due = Some(Instant::now() + snapshot_retry);
+                            snapshot_retry = next_retry(snapshot_retry);
+                        }
+                    }
+                    continue;
                 }
-                Err(error) => warn!(?error, "Sway IPC reconnect failed"),
+                Err(error) => {
+                    warn!(?error, ?event_type, "Sway IPC subscription connect failed");
+                    next_connect = Instant::now() + reconnect_retry;
+                    reconnect_retry = next_retry(reconnect_retry);
+                }
             }
-            retry = next_retry(retry);
+        }
+
+        if event_rx.is_none() {
+            enum DisconnectedAction {
+                Register(Option<Listener>),
+                Connect,
+                Maintain,
+            }
+
+            let action = tokio::select! {
+                listener = registrations.recv() => DisconnectedAction::Register(listener),
+                _ = tokio::time::sleep_until(next_connect) => DisconnectedAction::Connect,
+                _ = maintenance.tick() => DisconnectedAction::Maintain,
+            };
+            match action {
+                DisconnectedAction::Register(Some(listener)) if listener.is_alive() => {
+                    listeners.push(listener);
+                }
+                DisconnectedAction::Register(Some(_)) | DisconnectedAction::Maintain => {}
+                DisconnectedAction::Register(None) => return,
+                DisconnectedAction::Connect => next_connect = Instant::now(),
+            }
+            continue;
+        }
+
+        enum ActiveAction {
+            Register(Option<Listener>),
+            Event(Option<Result<Event>>),
+            Maintain,
+        }
+
+        let action = {
+            let events = event_rx.as_mut().expect("active event receiver");
+            tokio::select! {
+                listener = registrations.recv() => ActiveAction::Register(listener),
+                event = events.recv() => ActiveAction::Event(event),
+                _ = maintenance.tick() => ActiveAction::Maintain,
+            }
+        };
+
+        match action {
+            ActiveAction::Register(Some(listener)) if listener.is_alive() => {
+                match read_snapshot(event_type, &request_connection).await {
+                    Ok(snapshot) => {
+                        if listener.dispatch_snapshot(&snapshot) {
+                            listeners.push(listener);
+                        }
+                    }
+                    Err(error) => {
+                        warn!(?error, ?event_type, "Sway IPC listener snapshot failed");
+                        listeners.push(listener);
+                        snapshot_due.get_or_insert(Instant::now() + snapshot_retry);
+                        snapshot_retry = next_retry(snapshot_retry);
+                    }
+                }
+            }
+            ActiveAction::Register(Some(_)) => {}
+            ActiveAction::Register(None) => return,
+            ActiveAction::Event(Some(Ok(event))) => {
+                trace!(?event, "Sway IPC event");
+                listeners.retain(|listener| listener.dispatch_event(&event));
+            }
+            ActiveAction::Event(Some(Err(error))) => {
+                warn!(?error, ?event_type, "Sway IPC subscription disconnected");
+                stop_event_reader(&mut event_reader, &mut event_rx);
+                next_connect = Instant::now() + reconnect_retry;
+                reconnect_retry = next_retry(reconnect_retry);
+                snapshot_due = None;
+            }
+            ActiveAction::Event(None) => {
+                warn!(?event_type, "Sway IPC event reader stopped");
+                stop_event_reader(&mut event_reader, &mut event_rx);
+                next_connect = Instant::now() + reconnect_retry;
+                reconnect_retry = next_retry(reconnect_retry);
+                snapshot_due = None;
+            }
+            ActiveAction::Maintain => {
+                listeners.retain(Listener::is_alive);
+                if snapshot_due.is_some_and(|due| due <= Instant::now()) {
+                    match read_snapshot(event_type, &request_connection).await {
+                        Ok(snapshot) => {
+                            dispatch_snapshot(&mut listeners, &snapshot);
+                            snapshot_due = None;
+                            snapshot_retry = initial_retry;
+                        }
+                        Err(error) => {
+                            warn!(?error, ?event_type, "Sway IPC snapshot retry failed");
+                            snapshot_due = Some(Instant::now() + snapshot_retry);
+                            snapshot_retry = next_retry(snapshot_retry);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn read_snapshot(
+    event_type: EventType,
+    request_connection: &Arc<Mutex<RequestConnection>>,
+) -> Result<Snapshot> {
+    let mut connection = request_connection.lock().await;
+    match event_type {
+        EventType::Workspace => connection.get_workspaces().await.map(Snapshot::Workspace),
+        EventType::Input => connection.get_inputs().await.map(Snapshot::Input),
+        EventType::Mode => connection.get_binding_state().await.map(|change| {
+            Snapshot::Mode(ModeEvent {
+                change,
+                pango_markup: false,
+            })
+        }),
+    }
+}
+
+fn dispatch_snapshot(listeners: &mut Vec<Listener>, snapshot: &Snapshot) {
+    listeners.retain(|listener| listener.dispatch_snapshot(snapshot));
+}
+
+fn stop_event_reader(
+    event_reader: &mut Option<tokio::task::JoinHandle<()>>,
+    event_rx: &mut Option<mpsc::Receiver<Result<Event>>>,
+) {
+    if let Some(reader) = event_reader.take() {
+        reader.abort();
+    }
+    event_rx.take();
+}
+
+async fn event_reader_loop(
+    mut connection: Connection,
+    event_type: EventType,
+    events: mpsc::Sender<Result<Event>>,
+) {
+    loop {
+        match connection.next_event().await {
+            Ok(Some(event)) if event.event_type() == event_type => {
+                if events.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+            Ok(Some(event)) => {
+                trace!(
+                    ?event,
+                    ?event_type,
+                    "ignoring event from unrelated subscription"
+                );
+            }
+            Ok(None) => trace!("ignoring unsupported Sway IPC event"),
+            Err(Error::InvalidJson { context, source }) => {
+                // The complete frame has already been consumed, so malformed
+                // data for one known event cannot desynchronise later frames.
+                warn!(?source, context, "ignoring malformed Sway IPC event");
+            }
+            Err(error) => {
+                let _ = events.send(Err(error)).await;
+                return;
+            }
         }
     }
 }
@@ -697,8 +983,16 @@ fn next_retry(current: Duration) -> Duration {
 }
 
 fn sway_socket_path() -> Result<PathBuf> {
-    std::env::var_os("SWAYSOCK")
+    socket_path_from_values(std::env::var_os("SWAYSOCK"), std::env::var_os("I3SOCK"))
+}
+
+fn socket_path_from_values(
+    swaysock: Option<OsString>,
+    i3sock: Option<OsString>,
+) -> Result<PathBuf> {
+    swaysock
         .filter(|path| !path.is_empty())
+        .or_else(|| i3sock.filter(|path| !path.is_empty()))
         .map(PathBuf::from)
         .ok_or(Error::MissingSocket)
 }
@@ -731,8 +1025,8 @@ fn frame_header(payload_length: usize, message_type: u32) -> Result<[u8; HEADER_
     })?;
     let mut header = [0_u8; HEADER_LEN];
     header[..IPC_MAGIC.len()].copy_from_slice(IPC_MAGIC);
-    header[6..10].copy_from_slice(&payload_length.to_le_bytes());
-    header[10..14].copy_from_slice(&message_type.to_le_bytes());
+    header[6..10].copy_from_slice(&payload_length.to_ne_bytes());
+    header[10..14].copy_from_slice(&message_type.to_ne_bytes());
     Ok(header)
 }
 
@@ -756,7 +1050,7 @@ where
     if &header[..IPC_MAGIC.len()] != IPC_MAGIC {
         return Err(Error::InvalidMagic);
     }
-    let length = u32::from_le_bytes(header[6..10].try_into().expect("four-byte length")) as usize;
+    let length = u32::from_ne_bytes(header[6..10].try_into().expect("four-byte length")) as usize;
     if length > MAX_FRAME_BYTES {
         return Err(Error::FrameTooLarge {
             length,
@@ -764,7 +1058,7 @@ where
         });
     }
     let message_type =
-        u32::from_le_bytes(header[10..14].try_into().expect("four-byte message type"));
+        u32::from_ne_bytes(header[10..14].try_into().expect("four-byte message type"));
     let mut payload = vec![0_u8; length];
     reader.read_exact(&mut payload).await?;
     Ok(Frame {
@@ -830,13 +1124,34 @@ mod tests {
 
     #[test]
     fn protocol_header_bytes_match_i3_wire_format() {
-        assert_eq!(
-            frame_header(3, GET_WORKSPACES).expect("small frame should fit"),
-            [b'i', b'3', b'-', b'i', b'p', b'c', 3, 0, 0, 0, 1, 0, 0, 0,]
-        );
+        let header = frame_header(3, GET_WORKSPACES).expect("small frame should fit");
+        assert_eq!(&header[..6], IPC_MAGIC);
+        assert_eq!(&header[6..10], &3_u32.to_ne_bytes());
+        assert_eq!(&header[10..14], &GET_WORKSPACES.to_ne_bytes());
         assert!(matches!(
             frame_header(MAX_FRAME_BYTES + 1, RUN_COMMAND),
             Err(Error::FrameTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn socket_path_prefers_sway_and_falls_back_to_i3() {
+        assert_eq!(
+            socket_path_from_values(
+                Some(OsString::from("/run/sway.sock")),
+                Some(OsString::from("/run/i3.sock")),
+            )
+            .expect("SWAYSOCK should win"),
+            PathBuf::from("/run/sway.sock")
+        );
+        assert_eq!(
+            socket_path_from_values(None, Some(OsString::from("/run/i3.sock")))
+                .expect("I3SOCK should be accepted"),
+            PathBuf::from("/run/i3.sock")
+        );
+        assert!(matches!(
+            socket_path_from_values(Some(OsString::new()), None),
+            Err(Error::MissingSocket)
         ));
     }
 
@@ -866,7 +1181,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_frame_is_rejected_before_payload_allocation() {
         let mut header = frame_header(0, GET_INPUTS).expect("empty header should build");
-        header[6..10].copy_from_slice(&((MAX_FRAME_BYTES as u32) + 1).to_le_bytes());
+        header[6..10].copy_from_slice(&((MAX_FRAME_BYTES as u32) + 1).to_ne_bytes());
         let (mut writer, mut reader) = duplex(HEADER_LEN);
         writer
             .write_all(&header)
@@ -935,7 +1250,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_replies_decode_only_required_workspace_and_input_fields() {
+    async fn query_replies_decode_only_required_fields() {
         let (client, mut server) = duplex(8192);
         let mut connection = Connection::from_io(client);
         let task = tokio::spawn(async move {
@@ -962,6 +1277,14 @@ mod tests {
             )
             .await
             .expect("input response should write");
+
+            let binding_state = read_frame(&mut server)
+                .await
+                .expect("binding state request should arrive");
+            assert_eq!(binding_state.message_type, GET_BINDING_STATE);
+            write_frame(&mut server, GET_BINDING_STATE, br#"{"name":"resize"}"#)
+                .await
+                .expect("binding state response should write");
         });
 
         assert_eq!(
@@ -977,6 +1300,13 @@ mod tests {
                 .xkb_active_layout_name
                 .as_deref(),
             Some("English (US)")
+        );
+        assert_eq!(
+            connection
+                .get_binding_state()
+                .await
+                .expect("binding state should decode"),
+            "resize"
         );
         task.await.expect("query server should finish");
     }
@@ -1011,229 +1341,443 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn subscription_reconnects_and_resubscribes_after_eof() {
-        let (initial_client, mut initial_server) = duplex(8192);
-        let (reconnect_client, mut reconnect_server) = duplex(8192);
-        let mut initial = Connection::from_io(initial_client);
+    fn queued_connector(
+        connections: Vec<Result<Connection>>,
+        connect_count: Arc<AtomicUsize>,
+    ) -> Connector {
+        let connections = Arc::new(StdMutex::new(VecDeque::from(connections)));
+        Arc::new(move || {
+            connect_count.fetch_add(1, Ordering::SeqCst);
+            let next = connections
+                .lock()
+                .expect("test connection queue lock")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(Error::Io(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "no test connection remains",
+                    )))
+                });
+            Box::pin(std::future::ready(next))
+        })
+    }
 
-        let first_server = tokio::spawn(async move {
-            acknowledge_subscription(&mut initial_server, &["workspace"]).await;
+    #[tokio::test]
+    async fn startup_without_socket_keeps_supervisor_until_snapshot_and_event_arrive() {
+        let (subscription_client, mut subscription_server) = duplex(8192);
+        let (request_client, mut request_server) = duplex(8192);
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let connector = queued_connector(
+            vec![
+                Err(Error::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "fixture socket is not available yet",
+                ))),
+                Ok(Connection::from_io(subscription_client)),
+                Ok(Connection::from_io(request_client)),
+            ],
+            connect_count.clone(),
+        );
+        let client = Client::with_connector(connector);
+
+        let subscription_task = tokio::spawn(async move {
+            acknowledge_subscription(&mut subscription_server, &["workspace"]).await;
             write_frame(
-                &mut initial_server,
+                &mut subscription_server,
                 WORKSPACE_EVENT,
-                br#"{"change":"init","current":{"id":1,"num":1,"name":"one","output":"DP-1"}}"#,
+                br#"{"change":"focus","current":{"id":2,"num":2,"name":"event","output":"DP-1"}}"#,
             )
             .await
-            .expect("first event should write");
+            .expect("queued workspace event should write");
+            std::future::pending::<()>().await;
         });
-        initial
-            .subscribe(&[EventType::Workspace])
+        let request_task = tokio::spawn(async move {
+            let request = read_frame(&mut request_server)
+                .await
+                .expect("workspace snapshot request should arrive");
+            assert_eq!(request.message_type, GET_WORKSPACES);
+            write_frame(
+                &mut request_server,
+                GET_WORKSPACES,
+                br#"[{"id":1,"num":1,"name":"snapshot","output":"DP-1"}]"#,
+            )
             .await
-            .expect("initial subscription should succeed");
+            .expect("workspace snapshot should write");
+        });
 
-        let second_server = tokio::spawn(async move {
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (messages_tx, mut messages_rx) = mpsc::unbounded_channel();
+        client
+            .add_workspace_listener(
+                {
+                    let alive = alive.clone();
+                    move || alive.load(Ordering::SeqCst)
+                },
+                move |message| messages_tx.send(message.clone()).is_ok(),
+            )
+            .await
+            .expect("workspace listener should register while disconnected");
+
+        let first = timeout(Duration::from_secs(2), messages_rx.recv())
+            .await
+            .expect("startup snapshot timeout")
+            .expect("startup snapshot channel should stay open");
+        assert!(matches!(
+            first,
+            WorkspaceMessage::Snapshot(workspaces)
+                if workspaces.iter().map(|workspace| workspace.id).collect::<Vec<_>>() == [1]
+        ));
+        let second = timeout(Duration::from_secs(1), messages_rx.recv())
+            .await
+            .expect("queued event timeout")
+            .expect("queued event channel should stay open");
+        assert!(matches!(
+            second,
+            WorkspaceMessage::Event(WorkspaceEvent {
+                current: Some(Node { id: 2, .. }),
+                ..
+            })
+        ));
+        assert_eq!(connect_count.load(Ordering::SeqCst), 3);
+
+        alive.store(false, Ordering::SeqCst);
+        drop(client);
+        request_task.await.expect("snapshot server should finish");
+        subscription_task.abort();
+        let _ = subscription_task.await;
+    }
+
+    #[tokio::test]
+    async fn eof_reconnect_resnapshots_before_queued_event() {
+        let (initial_client, mut initial_server) = duplex(8192);
+        let (request_client, mut request_server) = duplex(8192);
+        let (reconnect_client, mut reconnect_server) = duplex(8192);
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let connector = queued_connector(
+            vec![
+                Ok(Connection::from_io(initial_client)),
+                Ok(Connection::from_io(request_client)),
+                Ok(Connection::from_io(reconnect_client)),
+            ],
+            connect_count.clone(),
+        );
+        let client = Client::with_connector(connector);
+
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+        let initial_task = tokio::spawn(async move {
+            acknowledge_subscription(&mut initial_server, &["workspace"]).await;
+            close_rx.await.expect("initial socket close signal");
+        });
+        let request_task = tokio::spawn(async move {
+            for payload in [
+                br#"[{"id":1,"num":1,"name":"old","output":"DP-1"},{"id":3,"num":3,"name":"gone","output":"DP-1"}]"#.as_slice(),
+                br#"[{"id":1,"num":1,"name":"renamed","output":"DP-1"},{"id":2,"num":2,"name":"new","output":"DP-1","focused":true}]"#.as_slice(),
+            ] {
+                let request = read_frame(&mut request_server)
+                    .await
+                    .expect("workspace snapshot request should arrive");
+                assert_eq!(request.message_type, GET_WORKSPACES);
+                write_frame(&mut request_server, GET_WORKSPACES, payload)
+                    .await
+                    .expect("workspace snapshot should write");
+            }
+        });
+        let reconnect_task = tokio::spawn(async move {
             acknowledge_subscription(&mut reconnect_server, &["workspace"]).await;
             write_frame(
                 &mut reconnect_server,
                 WORKSPACE_EVENT,
-                br#"{"change":"init","current":{"id":2,"num":2,"name":"two","output":"DP-1"}}"#,
+                br#"{"change":"focus","current":{"id":2,"num":2,"name":"new","output":"DP-1","focused":true}}"#,
             )
             .await
-            .expect("second event should write");
+            .expect("reconnected event should write");
             std::future::pending::<()>().await;
         });
 
-        let reconnects = Arc::new(StdMutex::new(VecDeque::from([Connection::from_io(
-            reconnect_client,
-        )])));
-        let connector: Connector = {
-            let reconnects = reconnects.clone();
-            Arc::new(move || {
-                let next = reconnects
-                    .lock()
-                    .expect("reconnect queue lock")
-                    .pop_front()
-                    .ok_or_else(|| {
-                        Error::Io(io::Error::new(
-                            io::ErrorKind::NotConnected,
-                            "no test reconnect remains",
-                        ))
-                    });
-                Box::pin(std::future::ready(next))
-            })
-        };
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (messages_tx, mut messages_rx) = mpsc::unbounded_channel();
+        client
+            .add_workspace_listener(
+                {
+                    let alive = alive.clone();
+                    move || alive.load(Ordering::SeqCst)
+                },
+                move |message| messages_tx.send(message.clone()).is_ok(),
+            )
+            .await
+            .expect("workspace listener should register");
 
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let mut listeners = Listeners::default();
-        listeners.workspaces.push(Arc::new(move |event| {
-            let _ = events_tx.send(
-                event
-                    .current
-                    .as_ref()
-                    .and_then(|workspace| workspace.name.clone())
-                    .unwrap_or_default(),
-            );
-        }));
-        let task = tokio::spawn(subscription_loop(
-            Some(initial),
-            vec![EventType::Workspace],
-            Arc::new(RwLock::new(listeners)),
-            connector,
-            Duration::ZERO,
-            Duration::from_secs(1),
+        let initial = timeout(Duration::from_secs(1), messages_rx.recv())
+            .await
+            .expect("initial snapshot timeout")
+            .expect("initial snapshot channel should stay open");
+        assert!(matches!(
+            initial,
+            WorkspaceMessage::Snapshot(workspaces)
+                if workspaces.iter().map(|workspace| (workspace.id, workspace.name.as_str())).collect::<Vec<_>>()
+                    == [(1, "old"), (3, "gone")]
         ));
+        close_tx
+            .send(())
+            .expect("initial subscription should be closed");
 
-        assert_eq!(
-            timeout(Duration::from_secs(1), events_rx.recv())
-                .await
-                .expect("first event timeout"),
-            Some("one".to_string())
-        );
-        assert_eq!(
-            timeout(Duration::from_secs(1), events_rx.recv())
-                .await
-                .expect("reconnected event timeout"),
-            Some("two".to_string())
-        );
+        let resnapshot = timeout(Duration::from_secs(2), messages_rx.recv())
+            .await
+            .expect("reconnect snapshot timeout")
+            .expect("reconnect snapshot channel should stay open");
+        assert!(matches!(
+            resnapshot,
+            WorkspaceMessage::Snapshot(workspaces)
+                if workspaces.iter().map(|workspace| (workspace.id, workspace.name.as_str())).collect::<Vec<_>>()
+                    == [(1, "renamed"), (2, "new")]
+        ));
+        let queued_event = timeout(Duration::from_secs(1), messages_rx.recv())
+            .await
+            .expect("reconnected event timeout")
+            .expect("reconnected event channel should stay open");
+        assert!(matches!(
+            queued_event,
+            WorkspaceMessage::Event(WorkspaceEvent {
+                current: Some(Node { id: 2, .. }),
+                ..
+            })
+        ));
+        assert_eq!(connect_count.load(Ordering::SeqCst), 3);
 
-        task.abort();
-        let _ = task.await;
-        first_server.await.expect("first server should finish");
-        second_server.abort();
-        let _ = second_server.await;
+        alive.store(false, Ordering::SeqCst);
+        drop(client);
+        initial_task.await.expect("initial server should finish");
+        request_task.await.expect("request server should finish");
+        reconnect_task.abort();
+        let _ = reconnect_task.await;
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn adding_listeners_preserves_healthy_per_type_subscriptions() {
-        let (request_client, _request_server) = duplex(1024);
-        let (workspace_client, mut workspace_server) = duplex(4096);
-        let (input_client, mut input_server) = duplex(4096);
-        let connections = Arc::new(StdMutex::new(VecDeque::from([
-            Connection::from_io(workspace_client),
-            Connection::from_io(input_client),
-        ])));
+    #[tokio::test]
+    async fn failed_reconnect_snapshot_retains_state_and_retries_without_losing_event() {
+        let (initial_client, mut initial_server) = duplex(8192);
+        let (request_client, mut request_server) = duplex(8192);
+        let (reconnect_client, mut reconnect_server) = duplex(8192);
+        let (retry_request_client, mut retry_request_server) = duplex(8192);
         let connect_count = Arc::new(AtomicUsize::new(0));
-        let connector: Connector = {
-            let connections = connections.clone();
-            let connect_count = connect_count.clone();
-            Arc::new(move || {
-                connect_count.fetch_add(1, Ordering::SeqCst);
-                let next = connections
-                    .lock()
-                    .expect("listener connection queue lock")
-                    .pop_front()
-                    .ok_or_else(|| {
-                        Error::Io(io::Error::new(
-                            io::ErrorKind::NotConnected,
-                            "no listener connection remains",
-                        ))
-                    });
-                Box::pin(std::future::ready(next))
-            })
-        };
-        let client = Client {
-            connection: Arc::new(Mutex::new(RequestConnection::new(
-                Connection::from_io(request_client),
-                connector.clone(),
-            ))),
-            task_state: Mutex::new(TaskState {
-                join_handles: [None, None, None],
-                listeners: Arc::new(RwLock::new(Listeners::default())),
-            }),
-            connect: connector,
-        };
+        let connector = queued_connector(
+            vec![
+                Ok(Connection::from_io(initial_client)),
+                Ok(Connection::from_io(request_client)),
+                Ok(Connection::from_io(reconnect_client)),
+                Ok(Connection::from_io(retry_request_client)),
+            ],
+            connect_count.clone(),
+        );
+        let request_connection = Arc::new(Mutex::new(RequestConnection::new(connector.clone())));
+        let (registrations, registration_rx) = mpsc::channel(1);
+        let supervisor = tokio::spawn(subscription_supervisor(
+            EventType::Workspace,
+            registration_rx,
+            request_connection,
+            connector,
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        ));
 
-        let (workspace_release_tx, workspace_release_rx) = tokio::sync::oneshot::channel();
-        let workspace_task = tokio::spawn(async move {
-            acknowledge_subscription(&mut workspace_server, &["workspace"]).await;
-            workspace_release_rx
-                .await
-                .expect("workspace event release signal");
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+        let initial_task = tokio::spawn(async move {
+            acknowledge_subscription(&mut initial_server, &["workspace"]).await;
+            close_rx.await.expect("initial socket close signal");
+        });
+        let reconnect_task = tokio::spawn(async move {
+            acknowledge_subscription(&mut reconnect_server, &["workspace"]).await;
             write_frame(
-                &mut workspace_server,
+                &mut reconnect_server,
                 WORKSPACE_EVENT,
-                br#"{"change":"focus","current":{"id":17,"num":2,"name":"two","output":"DP-1"}}"#,
+                br#"{"change":"focus","current":{"id":7,"num":7,"name":"queued","output":"DP-1"}}"#,
             )
             .await
-            .expect("workspace event should write");
+            .expect("event during failed snapshot should write");
             std::future::pending::<()>().await;
         });
-        let (input_release_tx, input_release_rx) = tokio::sync::oneshot::channel();
-        let input_task = tokio::spawn(async move {
-            acknowledge_subscription(&mut input_server, &["input"]).await;
-            input_release_rx.await.expect("input event release signal");
+        let request_task = tokio::spawn(async move {
+            let initial = read_frame(&mut request_server)
+                .await
+                .expect("initial snapshot request should arrive");
+            assert_eq!(initial.message_type, GET_WORKSPACES);
             write_frame(
-                &mut input_server,
-                INPUT_EVENT,
-                br#"{"change":"xkb_layout","input":{"identifier":"keyboard","xkb_active_layout_name":"US"}}"#,
+                &mut request_server,
+                GET_WORKSPACES,
+                br#"[{"id":4,"num":4,"name":"retained","output":"DP-1","focused":true}]"#,
             )
             .await
-            .expect("input event should write");
-            std::future::pending::<()>().await;
+            .expect("initial snapshot should write");
+
+            let failed = read_frame(&mut request_server)
+                .await
+                .expect("reconnect snapshot request should arrive");
+            assert_eq!(failed.message_type, GET_WORKSPACES);
+            // Drop the request socket without replying. The already displayed
+            // snapshot must remain intact while a later request retries.
+        });
+        let retry_request_task = tokio::spawn(async move {
+            let request = read_frame(&mut retry_request_server)
+                .await
+                .expect("retried snapshot request should arrive");
+            assert_eq!(request.message_type, GET_WORKSPACES);
+            write_frame(
+                &mut retry_request_server,
+                GET_WORKSPACES,
+                br#"[{"id":7,"num":7,"name":"queued","output":"DP-1","focused":true}]"#,
+            )
+            .await
+            .expect("retried snapshot should write");
         });
 
-        let (workspace_events_tx, mut workspace_events_rx) = mpsc::unbounded_channel();
-        let first_tx = workspace_events_tx.clone();
-        client
-            .add_workspace_listener(move |event| {
-                let _ = first_tx.send(("first", event.current.as_ref().map(|node| node.id)));
-            })
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (messages_tx, mut messages_rx) = mpsc::unbounded_channel();
+        registrations
+            .send(Listener::Workspace(ListenerEntry {
+                alive: {
+                    let alive = alive.clone();
+                    Arc::new(move || alive.load(Ordering::SeqCst))
+                },
+                callback: Arc::new(move |message| messages_tx.send(message.clone()).is_ok()),
+            }))
             .await
-            .expect("first workspace listener should register");
-        client
-            .add_workspace_listener(move |event| {
-                let _ = workspace_events_tx
-                    .send(("second", event.current.as_ref().map(|node| node.id)));
-            })
-            .await
-            .expect("second workspace listener should share the subscription");
+            .expect("listener should register");
 
-        let (input_events_tx, mut input_events_rx) = mpsc::unbounded_channel();
-        client
-            .add_input_listener(move |event| {
-                let _ = input_events_tx.send(event.input.identifier.clone());
-            })
+        let initial = timeout(Duration::from_secs(1), messages_rx.recv())
             .await
-            .expect("input listener should register independently");
-        assert_eq!(connect_count.load(Ordering::SeqCst), 2);
+            .expect("initial snapshot timeout")
+            .expect("initial snapshot channel should stay open");
+        assert!(matches!(
+            initial,
+            WorkspaceMessage::Snapshot(workspaces)
+                if workspaces.len() == 1
+                    && workspaces[0].id == 4
+                    && workspaces[0].name == "retained"
+        ));
+        close_tx
+            .send(())
+            .expect("initial subscription should close");
+
+        let next = timeout(Duration::from_secs(1), messages_rx.recv())
+            .await
+            .expect("post-failure update timeout")
+            .expect("post-failure channel should stay open");
+        let last = timeout(Duration::from_secs(1), messages_rx.recv())
+            .await
+            .expect("post-failure update timeout")
+            .expect("post-failure channel should stay open");
         assert!(
-            connections
-                .lock()
-                .expect("listener connection queue lock")
-                .is_empty()
+            [&next, &last].iter().any(|message| matches!(
+                message,
+                WorkspaceMessage::Event(WorkspaceEvent {
+                    current: Some(Node { id: 7, .. }),
+                    ..
+                })
+            )),
+            "the event queued during snapshot failure must be delivered"
         );
+        assert!(
+            [&next, &last].iter().all(|message| !matches!(
+                message,
+                WorkspaceMessage::Snapshot(workspaces) if workspaces.is_empty()
+            )),
+            "a failed reconnect snapshot must not fabricate an empty reset"
+        );
+        assert!(
+            [&next, &last].iter().any(|message| matches!(
+                message,
+                WorkspaceMessage::Snapshot(workspaces)
+                    if workspaces.len() == 1 && workspaces[0].id == 7
+            )),
+            "a successful snapshot retry must eventually replace retained state"
+        );
+        assert_eq!(connect_count.load(Ordering::SeqCst), 4);
 
-        workspace_release_tx
-            .send(())
-            .expect("workspace event should be released");
-        input_release_tx
-            .send(())
-            .expect("input event should be released");
-        assert_eq!(
-            timeout(Duration::from_secs(1), workspace_events_rx.recv())
-                .await
-                .expect("first shared workspace callback timeout"),
-            Some(("first", Some(17)))
-        );
-        assert_eq!(
-            timeout(Duration::from_secs(1), workspace_events_rx.recv())
-                .await
-                .expect("second shared workspace callback timeout"),
-            Some(("second", Some(17)))
-        );
-        assert_eq!(
-            timeout(Duration::from_secs(1), input_events_rx.recv())
-                .await
-                .expect("independent input callback timeout"),
-            Some("keyboard".to_string())
-        );
+        alive.store(false, Ordering::SeqCst);
+        drop(registrations);
+        supervisor.abort();
+        let _ = supervisor.await;
+        initial_task.await.expect("initial server should finish");
+        request_task.await.expect("request server should finish");
+        retry_request_task
+            .await
+            .expect("retry request server should finish");
+        reconnect_task.abort();
+        let _ = reconnect_task.await;
+    }
 
-        drop(client);
-        workspace_task.abort();
-        input_task.abort();
-        let _ = workspace_task.await;
-        let _ = input_task.await;
+    #[tokio::test]
+    async fn vanished_receiver_prunes_listener_and_stops_socket_without_reconnect() {
+        let (subscription_client, mut subscription_server) = duplex(8192);
+        let (request_client, mut request_server) = duplex(8192);
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let connector = queued_connector(
+            vec![
+                Ok(Connection::from_io(subscription_client)),
+                Ok(Connection::from_io(request_client)),
+            ],
+            connect_count.clone(),
+        );
+        let request_connection = Arc::new(Mutex::new(RequestConnection::new(connector.clone())));
+        let (registrations, registration_rx) = mpsc::channel(1);
+        let supervisor = tokio::spawn(subscription_supervisor(
+            EventType::Workspace,
+            registration_rx,
+            request_connection,
+            connector,
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        ));
+
+        let subscription_task = tokio::spawn(async move {
+            acknowledge_subscription(&mut subscription_server, &["workspace"]).await;
+            let mut byte = [0_u8; 1];
+            subscription_server
+                .read_exact(&mut byte)
+                .await
+                .expect_err("pruned listener should close event socket");
+        });
+        let request_task = tokio::spawn(async move {
+            let request = read_frame(&mut request_server)
+                .await
+                .expect("workspace snapshot request should arrive");
+            assert_eq!(request.message_type, GET_WORKSPACES);
+            write_frame(&mut request_server, GET_WORKSPACES, b"[]")
+                .await
+                .expect("workspace snapshot should write");
+        });
+
+        let (updates, mut receiver) = tokio::sync::broadcast::channel(4);
+        let alive_updates = updates.clone();
+        let callback_updates = updates.clone();
+        registrations
+            .send(Listener::Workspace(ListenerEntry {
+                alive: Arc::new(move || alive_updates.receiver_count() > 0),
+                callback: Arc::new(move |message| callback_updates.send(message.clone()).is_ok()),
+            }))
+            .await
+            .expect("listener should register");
+        assert!(matches!(
+            timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("snapshot timeout")
+                .expect("snapshot should broadcast"),
+            WorkspaceMessage::Snapshot(workspaces) if workspaces.is_empty()
+        ));
+        drop(receiver);
+
+        timeout(Duration::from_secs(1), subscription_task)
+            .await
+            .expect("event socket close timeout")
+            .expect("subscription server should finish");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(connect_count.load(Ordering::SeqCst), 2);
+
+        request_task.await.expect("request server should finish");
+        drop(registrations);
+        supervisor.abort();
+        let _ = supervisor.await;
     }
 
     #[tokio::test]
@@ -1259,7 +1803,8 @@ mod tests {
                 Box::pin(std::future::ready(next))
             })
         };
-        let mut request = RequestConnection::new(Connection::from_io(first_client), connector);
+        let mut request =
+            RequestConnection::with_current(Connection::from_io(first_client), connector);
 
         let first = tokio::spawn(async move {
             let command = read_frame(&mut first_server)

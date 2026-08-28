@@ -57,7 +57,10 @@ impl Compositor {
     /// Attempts to get the current compositor.
     /// This is done by checking system env vars.
     fn get_current() -> Self {
-        if std::env::var("SWAYSOCK").is_ok() {
+        if ["SWAYSOCK", "I3SOCK"]
+            .into_iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+        {
             cfg_if! {
                 if #[cfg(feature = "sway")] { Self::Sway }
                 else { tracing::error!("Not compiled with Sway support"); Self::Unsupported }
@@ -227,6 +230,12 @@ pub enum WorkspaceUpdate {
     /// Provides an initial list of workspaces.
     /// This is re-sent to all subscribers when a new subscription is created.
     Init(Vec<Workspace>),
+    /// Replaces the current workspace state after a compositor reconnect.
+    ///
+    /// Unlike [`Self::Init`], this is intended for existing subscribers and
+    /// must reconcile workspaces that disappeared while the event stream was
+    /// unavailable.
+    Resync(Vec<Workspace>),
     Add(Workspace),
     Remove(i64),
     Move(Workspace),

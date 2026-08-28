@@ -390,6 +390,7 @@ impl Module<gtk::Box> for WorkspacesModule {
                         let label = item_context.format_label(&workspace.name, workspace.index);
                         btn.set_label(&label);
                         btn.set_monitor(&workspace.monitor);
+                        btn.set_open_state(workspace.visibility.into());
                         btn.button().set_tag("workspace_index", workspace.index);
                     } else {
                         let btn = Button::new(
@@ -455,6 +456,32 @@ impl Module<gtk::Box> for WorkspacesModule {
                         reorder!();
 
                         has_initialized = true;
+                    }
+                    WorkspaceUpdate::Resync(workspaces) if has_initialized => {
+                        let workspaces = workspaces
+                            .into_iter()
+                            .filter(|workspace| {
+                                self.all_monitors || workspace.monitor == output_name
+                            })
+                            .filter(|workspace| !self.hidden.contains(&workspace.name))
+                            .collect::<Vec<_>>();
+                        let current_ids = workspaces
+                            .iter()
+                            .map(|workspace| workspace.id)
+                            .collect::<std::collections::HashSet<_>>();
+                        let stale_ids = button_map
+                            .values()
+                            .filter_map(Button::workspace_id)
+                            .filter(|id| !current_ids.contains(id))
+                            .collect::<Vec<_>>();
+
+                        for id in stale_ids {
+                            remove_workspace(id, &mut button_map);
+                        }
+                        for workspace in workspaces {
+                            add_workspace(workspace, &mut button_map);
+                        }
+                        reorder!();
                     }
                     WorkspaceUpdate::Add(workspace) if has_initialized => {
                         if !self.hidden.contains(&workspace.name)
