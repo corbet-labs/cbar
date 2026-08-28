@@ -183,6 +183,13 @@ impl Ipc {
 
                 let windows = application.windows();
                 for window in windows {
+                    #[cfg(feature = "matrix_launcher")]
+                    if ironbar
+                        .matrix_launcher()
+                        .is_some_and(|launcher| launcher.owns_window(&window))
+                    {
+                        continue;
+                    }
                     window.close();
                 }
 
@@ -197,6 +204,27 @@ impl Ipc {
             Command::Var(cmd) => ironvar::handle_command(cmd),
             Command::Bar(cmd) => bar::handle_command(&cmd, ironbar),
             Command::Style(cmd) => style::handle_command(cmd, ironbar),
+            #[cfg(feature = "matrix_launcher")]
+            Command::Launcher(cmd) => {
+                use crate::ipc::LauncherCommand;
+
+                let Some(launcher) = ironbar.matrix_launcher() else {
+                    return Response::error("launcher is not initialized");
+                };
+                let result = match cmd {
+                    LauncherCommand::Show => launcher.show().map(|()| Response::Ok),
+                    LauncherCommand::Hide => {
+                        launcher.hide();
+                        Ok(Response::Ok)
+                    }
+                    LauncherCommand::Toggle => launcher.toggle().map(|()| Response::Ok),
+                    LauncherCommand::Refresh => launcher.refresh().map(|()| Response::Ok),
+                    LauncherCommand::Status => Ok(Response::OkValue {
+                        value: launcher.status(),
+                    }),
+                };
+                result.unwrap_or_else(|error| Response::error(&error))
+            }
         }
     }
 

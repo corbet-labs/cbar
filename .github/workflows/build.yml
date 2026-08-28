@@ -7,6 +7,8 @@ on:
     paths:
       - 'src/**/*'
       - 'launch-service/**/*'
+      - 'launcher-core/**/*'
+      - 'launcher-gtk/**/*'
       - 'Cargo.*'
       - 'build.rs'
   pull_request:
@@ -14,6 +16,8 @@ on:
     paths:
       - 'src/**/*'
       - 'launch-service/**/*'
+      - 'launcher-core/**/*'
+      - 'launcher-gtk/**/*'
       - 'Cargo.*'
       - 'build.rs'
       - '.github/workflows/build.yml'
@@ -87,16 +91,29 @@ jobs:
         with:
           command: test
 
-      - name: Run launch service tests
-        run: cargo test --manifest-path launch-service/Cargo.toml
+  launcher:
+    name: 'Launcher crates'
+    runs-on: ubuntu-latest
+    container: ghcr.io/jakestanger/ironbar-build:master
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+        name: Cache dependencies
+
+      - name: Clippy
+        run: >-
+          cargo clippy -p ironbar-launch-service -p cbar-launcher-core
+          -p cbar-launcher --all-targets -- -D warnings
+
+      - name: Run tests
+        run: >-
+          cargo test -p ironbar-launch-service -p cbar-launcher-core
+          -p cbar-launcher --all-targets
 
       - name: Verify launch service package
         run: cargo package --manifest-path launch-service/Cargo.toml --allow-dirty
-
-      - name: Verify root package against staged launch service
-        run: >-
-          cargo package --allow-dirty
-          --config "patch.crates-io.ironbar-launch-service.path='${GITHUB_WORKSPACE}/launch-service'"
 
   feature-checks:
     name: 'Check feature flag'
@@ -131,6 +148,7 @@ jobs:
           - keyboard+hyprland
           - label
           - launcher
+          - matrix_launcher
           - menu
           - music+all
           - music+mpris

@@ -54,6 +54,8 @@ mod ipc;
 mod ironvar;
 mod logging;
 mod macros;
+#[cfg(feature = "matrix_launcher")]
+mod matrix_launcher;
 mod modules;
 mod popup;
 mod script;
@@ -163,6 +165,8 @@ pub struct Ironbar {
     scripts: Rc<RefCell<HashMap<String, Sender<()>>>>,
     desktop_files: DesktopFiles,
     image_provider: image::Provider,
+    #[cfg(feature = "matrix_launcher")]
+    matrix_launcher: RefCell<Option<matrix_launcher::Launcher>>,
 }
 
 impl Ironbar {
@@ -191,6 +195,8 @@ impl Ironbar {
             scripts: rc_mut!(HashMap::new()),
             desktop_files,
             image_provider,
+            #[cfg(feature = "matrix_launcher")]
+            matrix_launcher: RefCell::new(None),
         }
     }
 
@@ -226,6 +232,11 @@ impl Ironbar {
             }
 
             running.store(true, Ordering::Relaxed);
+
+            #[cfg(feature = "matrix_launcher")]
+            instance
+                .matrix_launcher
+                .replace(Some(matrix_launcher::Launcher::new(app)));
 
             #[cfg(feature = "ipc")]
             let ipc_path = match ipc::Ipc::new() {
@@ -284,6 +295,11 @@ impl Ironbar {
                         error!("{:?}", report);
                         exit(ExitCode::CreateBars as i32);
                     }
+                }
+
+                #[cfg(feature = "matrix_launcher")]
+                if let Some(launcher) = instance.matrix_launcher() {
+                    glib::idle_add_local_once(move || launcher.warm());
                 }
 
                 let outputs = instance.clients.borrow_mut().outputs();
@@ -355,6 +371,12 @@ impl Ironbar {
     #[must_use]
     pub fn image_provider(&self) -> image::Provider {
         self.image_provider.clone()
+    }
+
+    #[cfg(feature = "matrix_launcher")]
+    #[must_use]
+    pub fn matrix_launcher(&self) -> Option<matrix_launcher::Launcher> {
+        self.matrix_launcher.borrow().clone()
     }
 
     /// Gets clones of bars by their name.
