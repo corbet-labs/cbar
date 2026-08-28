@@ -2088,11 +2088,7 @@ fn build(
                             let b = GBox::new(Orientation::Horizontal, 4);
                             b.add_css_class("app");
 
-                            let img = match icon_cache.borrow_mut().texture(&app.icon, &icon_theme)
-                            {
-                                Some(tex) => Image::from_paintable(Some(&tex)),
-                                None => Image::from_icon_name(&app.icon),
-                            };
+                            let img = icons::Icons::image(&icon_cache, &app.icon, &icon_theme);
                             img.set_pixel_size(icon_px);
 
                             // Overlay only the existing icon, never the whole application. The app

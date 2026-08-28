@@ -30,33 +30,107 @@
 // ONE CLASS OF ENTRY IS EXEMPT, and stating it is the point of this paragraph. An `Icon=` may name
 // an absolute FILE rather than a theme icon, and such a file is reachable by no icon theme index --
 // so the theme stamp cannot see it change, and the argument above simply does not hold for it.
-// Those entries carry the file's own modification time in their key instead, which costs one stat
-// on a path we were about to open anyway and makes them self-validating rather than trusted.
+// Those entries carry the opened target descriptor's device, inode, size, mtime and ctime in their
+// key instead. Validation and any decode run in the bounded source lane, so they are self-validating
+// without putting filesystem work back onto GTK.
 use gtk4::prelude::*;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Bumped whenever the on-disk layout changes, so an old file is discarded rather than
 /// misread. A cache that cannot be parsed is simply absent -- never a reason to fail to start.
-const MAGIC: &[u8; 6] = b"CBLI04";
+const MAGIC: &[u8; 6] = b"CBLI05";
 const MAX_ICON_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RESIDENT_ICON_BYTES: usize = 128 * 1024 * 1024;
 const MAX_ICON_CACHE_ENTRIES: usize = 32_768;
 const MAX_ICON_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ICON_THEME_ROOTS: usize = 256;
 const MAX_ICON_THEME_DIRECTORIES: usize = 4_096;
+const MAX_PENDING_ICON_REQUESTS: usize = 512;
+const MAX_ICON_WAITERS: usize = 512;
+const ICON_WORK_QUEUE_CAPACITY: usize = 256;
+const MAX_ICON_WORKERS: usize = 4;
+const ICON_RESULT_POLL: Duration = Duration::from_millis(16);
+const ICON_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Separates an absolute icon path from the modification time that validates it. U+0001 because a
-/// key is otherwise an icon name or a file path, and neither may contain a control character --
-/// so no real name can be mistaken for a stamped one, whatever it is called.
+/// Separates an absolute icon path from the descriptor identity that validates it. Splitting from
+/// the right keeps even an unusual Unix path containing this byte representable.
 const STAMP_SEPARATOR: char = '\u{1}';
 
+static NEXT_ICON_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug)]
+enum IconSource {
+    Absolute(PathBuf),
+    Themed(PathBuf),
+}
+
+impl IconSource {
+    const fn is_absolute(&self) -> bool {
+        matches!(self, Self::Absolute(_))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Absolute(path) | Self::Themed(path) => path,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IconRequest {
+    generation: u64,
+    request_id: u64,
+    stamp: u64,
+    px: i32,
+    name: String,
+    source: IconSource,
+    cached_key: Option<String>,
+    result: SyncSender<IconResult>,
+}
+
+#[derive(Debug)]
+struct IconResult {
+    generation: u64,
+    request_id: u64,
+    stamp: u64,
+    px: i32,
+    name: String,
+    absolute: bool,
+    outcome: LoadOutcome,
+}
+
+#[derive(Debug)]
+enum LoadOutcome {
+    Cached { key: String },
+    Decoded { key: String, pixels: Arc<[u8]> },
+    Missing,
+}
+
+struct PendingIcon {
+    request_id: u64,
+    request: Option<IconRequest>,
+    waiters: Vec<gtk4::glib::WeakRef<gtk4::Image>>,
+    started: Instant,
+    absolute: bool,
+}
+
+struct IconWorkerPool {
+    requests: SyncSender<IconRequest>,
+}
+
 pub struct Icons {
+    generation: u64,
+    next_request_id: u64,
     px: i32,
     stamp: u64,
     /// WHERE this cache lives, carried rather than recomputed. Tests need their own file, and the
@@ -71,41 +145,72 @@ pub struct Icons {
     /// Separate from `pixels` because a texture cannot be written to a file and pixels cannot be
     /// drawn; keeping both costs one copy of 1.6kB per icon and saves rebuilding either.
     textures: HashMap<String, Option<gtk4::gdk::Texture>>,
+    /// The latest persisted descriptor-versioned key for each absolute path. It is only a worker
+    /// candidate: GTK never trusts it until the source descriptor has been opened and validated.
+    absolute_candidates: HashMap<String, String>,
+    /// Descriptor versions validated during this process and therefore safe for immediate redraws.
+    absolute_current: HashMap<String, String>,
+    pending: HashMap<String, PendingIcon>,
+    failed: HashSet<String>,
+    waiter_count: usize,
+    pump_active: bool,
+    result_tx: SyncSender<IconResult>,
+    result_rx: Receiver<IconResult>,
     /// Set when a name was decoded that the file did not have, i.e. the file is worth rewriting.
     dirty: bool,
 }
 
-/// What this icon is filed under, which for an absolute path includes when that file last changed.
-///
-/// A theme icon is keyed by its name and validated wholesale by the theme stamp. An absolute path
-/// cannot be: no theme index mentions it, so nothing about installing or removing software moves
-/// the stamp when such a file is replaced -- and a game that updates its artwork in place would
-/// otherwise show the old picture until something unrelated invalidated the whole cache. Folding
-/// the modification time into the key means a rewritten file simply misses and is decoded again.
-///
-/// A file that cannot be stated keeps its bare path, which is the conservative answer: it will be
-/// looked up and fail, rather than being cached under a key that claims to know something.
-fn cache_key(name: &str) -> String {
-    let path = std::path::Path::new(name);
-    if !path.is_absolute() {
-        return name.to_string();
+fn next_icon_generation() -> u64 {
+    let generation = NEXT_ICON_GENERATION.fetch_add(1, Ordering::Relaxed);
+    if generation == 0 {
+        NEXT_ICON_GENERATION.fetch_add(1, Ordering::Relaxed)
+    } else {
+        generation
     }
-    let Some((_, metadata)) = open_absolute_icon(path) else {
-        return name.to_string();
-    };
-    let Ok(modified) = metadata.modified() else {
-        return name.to_string();
-    };
-    let Ok(age) = modified.duration_since(std::time::UNIX_EPOCH) else {
-        return name.to_string();
-    };
-    format!("{name}{STAMP_SEPARATOR}{}", age.as_nanos())
 }
 
-fn open_absolute_icon(path: &std::path::Path) -> Option<(std::fs::File, std::fs::Metadata)> {
+fn absolute_cache_key(name: &str, metadata: &std::fs::Metadata) -> String {
+    format!(
+        "{name}{STAMP_SEPARATOR}{}:{}:{}:{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+fn absolute_name_from_key(key: &str) -> Option<&str> {
+    let (name, identity) = key.rsplit_once(STAMP_SEPARATOR)?;
+    if !std::path::Path::new(name).is_absolute()
+        || identity.split(':').count() != 7
+        || identity
+            .split(':')
+            .any(|field| field.parse::<i128>().is_err())
+    {
+        return None;
+    }
+    Some(name)
+}
+
+#[cfg(test)]
+thread_local! {
+    static SOURCE_OPEN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SOURCE_DECODE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn open_icon_source(path: &std::path::Path) -> Option<(std::fs::File, std::fs::Metadata)> {
+    #[cfg(test)]
+    SOURCE_OPEN_COUNT.with(|count| count.set(count.get() + 1));
+
+    // Source paths deliberately follow ordinary symlinks. The descriptor, rather than a path
+    // metadata check followed by a second open, is the authority from here onward: special files
+    // and oversized inputs are rejected with fstat and the exact same descriptor is read below.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .ok()?;
     let metadata = file.metadata().ok()?;
@@ -113,6 +218,130 @@ fn open_absolute_icon(path: &std::path::Path) -> Option<(std::fs::File, std::fs:
         return None;
     }
     Some((file, metadata))
+}
+
+fn decode_opened_source(
+    file: std::fs::File,
+    metadata: &std::fs::Metadata,
+    px: i32,
+    absolute: bool,
+) -> Option<Arc<[u8]>> {
+    let mut encoded = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_ICON_SOURCE_BYTES + 1)
+        .read_to_end(&mut encoded)
+        .ok()?;
+    if encoded.len() as u64 > MAX_ICON_SOURCE_BYTES {
+        return None;
+    }
+
+    #[cfg(test)]
+    SOURCE_DECODE_COUNT.with(|count| count.set(count.get() + 1));
+
+    let pixbuf = if absolute {
+        // Preserve the established absolute-file path exactly: its loader has always been given a
+        // target size before bytes, so raster and vector inputs retain the same final geometry.
+        let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
+        loader.set_size(px, px);
+        loader.write(&encoded).ok()?;
+        loader.close().ok()?;
+        loader.pixbuf()?
+    } else {
+        // `from_file_at_size` (the previous theme path) preserves aspect ratio. Decode the bytes
+        // already read from the validated descriptor through the equivalent stream API.
+        let bytes = gtk4::glib::Bytes::from_owned(encoded);
+        let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
+        gtk4::gdk_pixbuf::Pixbuf::from_stream_at_scale(
+            &stream,
+            px,
+            px,
+            true,
+            None::<&gtk4::gio::Cancellable>,
+        )
+        .ok()?
+    };
+    rgba_square(&pixbuf, px).map(Arc::from)
+}
+
+fn load_icon(request: &IconRequest) -> LoadOutcome {
+    let Some((file, metadata)) = open_icon_source(request.source.path()) else {
+        return LoadOutcome::Missing;
+    };
+    let key = if request.source.is_absolute() {
+        absolute_cache_key(&request.name, &metadata)
+    } else {
+        request.name.clone()
+    };
+    if request.cached_key.as_deref() == Some(&key) {
+        return LoadOutcome::Cached { key };
+    }
+    match decode_opened_source(file, &metadata, request.px, request.source.is_absolute()) {
+        Some(pixels) => LoadOutcome::Decoded { key, pixels },
+        None => LoadOutcome::Missing,
+    }
+}
+
+fn run_icon_request(request: IconRequest) {
+    let outcome = load_icon(&request);
+    let result = IconResult {
+        generation: request.generation,
+        request_id: request.request_id,
+        stamp: request.stamp,
+        px: request.px,
+        name: request.name,
+        absolute: request.source.is_absolute(),
+        outcome,
+    };
+    let _ = request.result.send(result);
+}
+
+fn icon_worker_count(parallelism: Option<usize>) -> usize {
+    parallelism
+        .unwrap_or(1)
+        .max(1)
+        .div_ceil(2)
+        .clamp(1, MAX_ICON_WORKERS)
+}
+
+impl IconWorkerPool {
+    fn start() -> Option<Self> {
+        let (requests, receiver) = sync_channel(ICON_WORK_QUEUE_CAPACITY);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let workers = icon_worker_count(
+            std::thread::available_parallelism()
+                .ok()
+                .map(std::num::NonZeroUsize::get),
+        );
+        let mut started = 0usize;
+        for index in 0..workers {
+            let receiver = receiver.clone();
+            if std::thread::Builder::new()
+                .name(format!("cbar-icon-source-{index}"))
+                .spawn(move || {
+                    loop {
+                        let request = {
+                            let Ok(receiver) = receiver.lock() else {
+                                return;
+                            };
+                            receiver.recv()
+                        };
+                        let Ok(request) = request else {
+                            return;
+                        };
+                        run_icon_request(request);
+                    }
+                })
+                .is_ok()
+            {
+                started += 1;
+            }
+        }
+        (started > 0).then_some(Self { requests })
+    }
+}
+
+fn icon_worker_pool() -> Option<&'static IconWorkerPool> {
+    static WORKERS: OnceLock<Option<IconWorkerPool>> = OnceLock::new();
+    WORKERS.get_or_init(IconWorkerPool::start).as_ref()
 }
 
 fn cache_path(px: i32) -> Option<PathBuf> {
@@ -322,12 +551,36 @@ impl PreparedIcons {
 
 impl Icons {
     pub(crate) fn from_prepared(prepared: PreparedIcons) -> Self {
+        let mut absolute_candidates = HashMap::new();
+        for key in prepared.pixels.keys() {
+            if let Some(name) = absolute_name_from_key(key) {
+                absolute_candidates
+                    .entry(name.to_string())
+                    .and_modify(|candidate: &mut String| {
+                        if key > candidate {
+                            *candidate = key.clone();
+                        }
+                    })
+                    .or_insert_with(|| key.clone());
+            }
+        }
+        let (result_tx, result_rx) = sync_channel(MAX_PENDING_ICON_REQUESTS);
         Self {
+            generation: next_icon_generation(),
+            next_request_id: 0,
             px: prepared.px,
             stamp: prepared.stamp,
             path: prepared.path,
             pixels: prepared.pixels,
             textures: HashMap::new(),
+            absolute_candidates,
+            absolute_current: HashMap::new(),
+            pending: HashMap::new(),
+            failed: HashSet::new(),
+            waiter_count: 0,
+            pump_active: false,
+            result_tx,
+            result_rx,
             dirty: false,
         }
     }
@@ -337,50 +590,359 @@ impl Icons {
         Self::from_prepared(PreparedIcons::load_from(path, px, stamp))
     }
 
-    /// The texture for `name`, from the cache when possible and from the icon theme when not.
-    pub fn texture(&mut self, name: &str, theme: &gtk4::IconTheme) -> Option<gtk4::gdk::Texture> {
+    /// A warm-only lookup. This function performs no source metadata, file access, theme lookup or
+    /// decoding; a miss is handed to [`Self::image`] and its bounded worker lane.
+    pub fn texture(&mut self, name: &str) -> Option<gtk4::gdk::Texture> {
         if name.is_empty() {
             return None;
         }
-        let key = cache_key(name);
-        if let Some(hit) = self.textures.get(&key) {
+        let key = if std::path::Path::new(name).is_absolute() {
+            self.absolute_current.get(name)?.clone()
+        } else {
+            name.to_string()
+        };
+        self.texture_for_key(&key)
+    }
+
+    fn texture_for_key(&mut self, key: &str) -> Option<gtk4::gdk::Texture> {
+        if let Some(hit) = self.textures.get(key) {
             return hit.clone();
         }
-        let px = self.px;
-        let (made, new_pixels) = match self.pixels.get(&key) {
-            // THE WARM PATH, and the whole point: no lookup, no file, no rasteriser.
-            Some(data) => (
-                Some(gtk4::gdk::MemoryTexture::new(
-                    px,
-                    px,
-                    gtk4::gdk::MemoryFormat::R8g8b8a8,
-                    &gtk4::glib::Bytes::from(data.as_ref()),
-                    (px * 4) as usize,
-                ))
-                .map(|t| t.upcast::<gtk4::gdk::Texture>()),
-                None,
-            ),
-            None => {
-                let decoded = decode(name, px, theme);
-                let pixels = decoded.as_ref().and_then(|pb| rgba_square(pb, px));
-                (
-                    decoded.map(|pb| gtk4::gdk::Texture::for_pixbuf(&pb).upcast()),
-                    pixels,
-                )
-            }
-        };
-        let add_pixels = usize::from(new_pixels.is_some());
-        if self.within_resident_budget(add_pixels, 1) {
-            if let Some(raw) = new_pixels {
-                self.pixels.insert(key.clone(), raw.into());
-                self.dirty = true;
-            }
-            self.textures.insert(key, made.clone());
+        let data = self.pixels.get(key)?.clone();
+        let made = Some(Self::texture_from_pixels(self.px, &data));
+        if self.within_resident_budget(0, 1) {
+            self.textures.insert(key.to_string(), made.clone());
         }
         made
     }
 
+    fn texture_from_pixels(px: i32, data: &[u8]) -> gtk4::gdk::Texture {
+        gtk4::gdk::MemoryTexture::new(
+            px,
+            px,
+            gtk4::gdk::MemoryFormat::R8g8b8a8,
+            &gtk4::glib::Bytes::from(data),
+            (px * 4) as usize,
+        )
+        .upcast()
+    }
+
+    /// Creates the exact image GTK should show now and arranges an in-place upgrade on a cold
+    /// cache miss. Theme icons use GTK's own resolved paintable immediately; absolute files remain
+    /// blank only until their descriptor has been validated and decoded off the main thread.
+    pub fn image(cache: &Rc<RefCell<Self>>, name: &str, theme: &gtk4::IconTheme) -> gtk4::Image {
+        let warm = cache.borrow_mut().texture(name);
+        if std::path::Path::new(name).is_absolute() {
+            let image = warm.as_ref().map_or_else(gtk4::Image::new, |texture| {
+                gtk4::Image::from_paintable(Some(texture))
+            });
+            Self::request(
+                cache,
+                name,
+                IconSource::Absolute(PathBuf::from(name)),
+                &image,
+            );
+            return image;
+        }
+        if let Some(texture) = warm {
+            return gtk4::Image::from_paintable(Some(&texture));
+        }
+        if name.is_empty() {
+            return gtk4::Image::new();
+        }
+
+        let paintable = theme.lookup_icon(
+            name,
+            &[],
+            cache.borrow().px,
+            1,
+            gtk4::TextDirection::None,
+            gtk4::IconLookupFlags::empty(),
+        );
+        let image = gtk4::Image::from_paintable(Some(&paintable));
+        if let Some(path) = paintable.file().and_then(|file| file.path()) {
+            Self::request(cache, name, IconSource::Themed(path), &image);
+        }
+        image
+    }
+
+    fn request(cache: &Rc<RefCell<Self>>, name: &str, source: IconSource, image: &gtk4::Image) {
+        let mut state = cache.borrow_mut();
+        if state.failed.contains(name) {
+            return;
+        }
+        if state.waiter_count >= MAX_ICON_WAITERS {
+            state.prune_waiters();
+        }
+        if state.waiter_count >= MAX_ICON_WAITERS {
+            return;
+        }
+        if let Some(pending) = state.pending.get_mut(name) {
+            pending.waiters.push(image.downgrade());
+            state.waiter_count += 1;
+            drop(state);
+            Self::ensure_pump(cache);
+            return;
+        }
+        if state.pending.len() >= MAX_PENDING_ICON_REQUESTS {
+            return;
+        }
+
+        state.next_request_id = state.next_request_id.wrapping_add(1);
+        if state.next_request_id == 0 {
+            state.next_request_id = 1;
+        }
+        let request_id = state.next_request_id;
+        let cached_key = source.is_absolute().then(|| {
+            state
+                .absolute_current
+                .get(name)
+                .or_else(|| state.absolute_candidates.get(name))
+                .cloned()
+        });
+        let cached_key = cached_key.flatten();
+        let request = IconRequest {
+            generation: state.generation,
+            request_id,
+            stamp: state.stamp,
+            px: state.px,
+            name: name.to_string(),
+            source,
+            cached_key,
+            result: state.result_tx.clone(),
+        };
+        state.pending.insert(
+            name.to_string(),
+            PendingIcon {
+                request_id,
+                absolute: request.source.is_absolute(),
+                request: Some(request),
+                waiters: vec![image.downgrade()],
+                started: Instant::now(),
+            },
+        );
+        state.waiter_count += 1;
+        state.flush_requests();
+        drop(state);
+        Self::ensure_pump(cache);
+    }
+
+    fn ensure_pump(cache: &Rc<RefCell<Self>>) {
+        {
+            let mut state = cache.borrow_mut();
+            if state.pump_active || state.pending.is_empty() {
+                return;
+            }
+            state.pump_active = true;
+        }
+        let cache = Rc::downgrade(cache);
+        gtk4::glib::timeout_add_local(ICON_RESULT_POLL, move || {
+            let Some(cache) = cache.upgrade() else {
+                return gtk4::glib::ControlFlow::Break;
+            };
+            let mut state = cache.borrow_mut();
+            state.drain_results();
+            state.expire_requests();
+            state.flush_requests();
+            if state.pending.is_empty() {
+                // Snapshot the cache once at the end of this request burst. `save` only hands
+                // immutable data to its writer, but collecting that snapshot is proportional to
+                // the resident icon count and must not run again on every 16 ms result poll.
+                state.save();
+                state.pump_active = false;
+                gtk4::glib::ControlFlow::Break
+            } else {
+                gtk4::glib::ControlFlow::Continue
+            }
+        });
+    }
+
+    fn prune_waiters(&mut self) {
+        let mut count = 0usize;
+        for pending in self.pending.values_mut() {
+            pending.waiters.retain(|waiter| waiter.upgrade().is_some());
+            count = count.saturating_add(pending.waiters.len());
+        }
+        self.waiter_count = count;
+    }
+
+    fn flush_requests(&mut self) {
+        let Some(pool) = icon_worker_pool() else {
+            self.fail_all_pending();
+            return;
+        };
+        let mut disconnected = false;
+        for pending in self.pending.values_mut() {
+            let Some(request) = pending.request.take() else {
+                continue;
+            };
+            match pool.requests.try_send(request) {
+                Ok(()) => {}
+                Err(TrySendError::Full(request)) => pending.request = Some(request),
+                Err(TrySendError::Disconnected(_)) => disconnected = true,
+            }
+        }
+        if disconnected {
+            self.fail_all_pending();
+        }
+    }
+
+    fn fail_all_pending(&mut self) {
+        if self.failed.len() < MAX_PENDING_ICON_REQUESTS {
+            self.failed.extend(
+                self.pending
+                    .keys()
+                    .take(MAX_PENDING_ICON_REQUESTS - self.failed.len())
+                    .cloned(),
+            );
+        }
+        self.pending.clear();
+        self.waiter_count = 0;
+    }
+
+    fn expire_requests(&mut self) {
+        let expired: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.started.elapsed() >= ICON_REQUEST_TIMEOUT)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in expired {
+            if let Some(pending) = self.pending.remove(&name) {
+                self.waiter_count = self.waiter_count.saturating_sub(pending.waiters.len());
+                if self.failed.len() < MAX_PENDING_ICON_REQUESTS {
+                    self.failed.insert(name);
+                }
+            }
+        }
+    }
+
+    fn drain_results(&mut self) {
+        while let Ok(result) = self.result_rx.try_recv() {
+            let Some(pending) = self.pending.get(&result.name) else {
+                continue;
+            };
+            if !self.result_is_current(&result, pending) {
+                continue;
+            }
+            let pending = self
+                .pending
+                .remove(&result.name)
+                .expect("a matching pending icon exists");
+            self.waiter_count = self.waiter_count.saturating_sub(pending.waiters.len());
+            self.apply_result(result, pending);
+        }
+    }
+
+    fn result_is_current(&self, result: &IconResult, pending: &PendingIcon) -> bool {
+        result.generation == self.generation
+            && result.request_id == pending.request_id
+            && result.stamp == self.stamp
+            && result.px == self.px
+            && result.absolute == pending.absolute
+    }
+
+    fn apply_result(&mut self, result: IconResult, pending: PendingIcon) {
+        let mut texture = None;
+        match result.outcome {
+            LoadOutcome::Cached { key } => {
+                texture = self.texture_for_key(&key);
+                if result.absolute && texture.is_some() {
+                    self.absolute_current.insert(result.name.clone(), key);
+                }
+            }
+            LoadOutcome::Decoded { key, pixels } => {
+                let expected = usize::try_from(self.px)
+                    .ok()
+                    .and_then(|px| px.checked_mul(px))
+                    .and_then(|px| px.checked_mul(4));
+                let replaced = result
+                    .absolute
+                    .then(|| self.absolute_candidates.get(&result.name).cloned())
+                    .flatten()
+                    .filter(|old| old != &key);
+                let remove_pixels = replaced
+                    .as_ref()
+                    .is_some_and(|old| self.pixels.contains_key(old));
+                let remove_textures = replaced
+                    .as_ref()
+                    .is_some_and(|old| self.textures.contains_key(old));
+                let pixel_count = self
+                    .pixels
+                    .len()
+                    .saturating_sub(usize::from(remove_pixels))
+                    .saturating_add(usize::from(!self.pixels.contains_key(&key)));
+                let texture_count = self
+                    .textures
+                    .len()
+                    .saturating_sub(usize::from(remove_textures))
+                    .saturating_add(usize::from(!self.textures.contains_key(&key)));
+                if expected != Some(pixels.len()) {
+                    if self.failed.len() < MAX_PENDING_ICON_REQUESTS {
+                        self.failed.insert(result.name.clone());
+                    }
+                    if result.absolute {
+                        self.absolute_current.remove(&result.name);
+                    }
+                } else if self.within_resident_budget_counts(pixel_count, texture_count) {
+                    if result.absolute
+                        && let Some(old) = self
+                            .absolute_candidates
+                            .insert(result.name.clone(), key.clone())
+                            .filter(|old| old != &key)
+                    {
+                        self.pixels.remove(&old);
+                        self.textures.remove(&old);
+                    }
+                    self.pixels.insert(key.clone(), pixels);
+                    self.dirty = true;
+                    texture = self.texture_for_key(&key);
+                    if result.absolute && texture.is_some() {
+                        self.absolute_current.insert(result.name.clone(), key);
+                    }
+                } else {
+                    // The materialized grid has its own byte cap, so a one-off texture remains
+                    // bounded even when the persistent resident cache is full. This preserves the
+                    // established visible result without admitting another cache entry.
+                    texture = Some(Self::texture_from_pixels(self.px, &pixels));
+                    if result.absolute {
+                        self.absolute_current.remove(&result.name);
+                    }
+                }
+            }
+            LoadOutcome::Missing => {
+                if self.failed.len() < MAX_PENDING_ICON_REQUESTS {
+                    self.failed.insert(result.name.clone());
+                }
+                if result.absolute {
+                    self.absolute_current.remove(&result.name);
+                }
+            }
+        }
+
+        for waiter in pending.waiters {
+            let Some(image) = waiter.upgrade() else {
+                continue;
+            };
+            if let Some(texture) = texture.as_ref() {
+                image.set_paintable(Some(texture));
+            } else if result.absolute {
+                image.set_paintable(None::<&gtk4::gdk::Texture>);
+            }
+        }
+    }
+
     fn within_resident_budget(&self, add_pixels: usize, add_textures: usize) -> bool {
+        let Some(pixels) = self.pixels.len().checked_add(add_pixels) else {
+            return false;
+        };
+        let Some(textures) = self.textures.len().checked_add(add_textures) else {
+            return false;
+        };
+        self.within_resident_budget_counts(pixels, textures)
+    }
+
+    fn within_resident_budget_counts(&self, pixels: usize, textures: usize) -> bool {
         let bytes = usize::try_from(self.px)
             .ok()
             .and_then(|size| size.checked_mul(size))
@@ -390,12 +952,9 @@ impl Icons {
             .map(|bytes| bytes.max(256));
         bytes
             .and_then(|bytes| {
-                self.pixels
-                    .len()
-                    .checked_add(add_pixels)?
-                    .checked_add(self.textures.len())?
-                    .checked_add(add_textures)?
-                    .checked_mul(bytes)
+                pixels
+                    .checked_add(textures)
+                    .and_then(|entries| entries.checked_mul(bytes))
             })
             .is_some_and(|bytes| bytes <= MAX_RESIDENT_ICON_BYTES)
     }
@@ -581,52 +1140,6 @@ fn write_cache(path: &std::path::Path, out: &[u8]) {
     let _ = std::fs::remove_file(tmp);
 }
 
-/// Resolve a name through the icon theme and rasterise it to `px` square.
-///
-/// This is the slow path, and everything above exists to run it as rarely as possible. Vector and
-/// raster take the same route deliberately: `IconPaintable` renders an SVG at the size asked for
-/// and a PNG at the file's own size, so going through the pixbuf loader for both is what makes the
-/// result uniformly small rather than uniformly whatever upstream shipped.
-fn decode(name: &str, px: i32, theme: &gtk4::IconTheme) -> Option<gtk4::gdk_pixbuf::Pixbuf> {
-    // Icon= may be either a theme name or an absolute file. Passing a file path to
-    // IconTheme::lookup_icon does not load that file; it searches for a theme icon literally
-    // carrying all those slash-separated characters and returns the missing-image paintable.
-    // Steam and standalone-game entries legitimately use absolute PNG paths, so recognise that
-    // half of the desktop-entry contract before asking the theme about ordinary names.
-    let candidate = PathBuf::from(name);
-    if candidate.is_absolute() {
-        // IS IT THERE. `is_absolute` is a purely lexical test, and an entry naming a file that has
-        // since been uninstalled would otherwise be handed to the loader as if it existed. Asking
-        // the theme about it instead would be worse than useless: no theme contains an icon called
-        // `/opt/something/icon.png`, so the lookup can only return the missing-image paintable.
-        let (file, metadata) = open_absolute_icon(&candidate)?;
-        let mut encoded = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAX_ICON_SOURCE_BYTES + 1)
-            .read_to_end(&mut encoded)
-            .ok()?;
-        if encoded.len() as u64 > MAX_ICON_SOURCE_BYTES {
-            return None;
-        }
-        let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
-        loader.set_size(px, px);
-        loader.write(&encoded).ok()?;
-        loader.close().ok()?;
-        return loader.pixbuf();
-    }
-    let path = theme
-        .lookup_icon(
-            name,
-            &[],
-            px,
-            1,
-            gtk4::TextDirection::None,
-            gtk4::IconLookupFlags::empty(),
-        )
-        .file()?
-        .path()?;
-    gtk4::gdk_pixbuf::Pixbuf::from_file_at_size(&path, px, px).ok()
-}
-
 /// Pixels as an exactly `px` by `px` RGBA block, which is what the cache format stores and what
 /// `MemoryTexture` wants. A loader asked for a size gives back something that FITS it, preserving
 /// aspect, so a wide icon comes back short -- centring it here means every entry is one fixed
@@ -676,40 +1189,75 @@ mod tests {
     }
 
     fn blank(path: PathBuf, px: i32, stamp: u64) -> Icons {
-        Icons {
+        let mut icons = Icons::from_prepared(PreparedIcons::empty(Some(path), px, stamp));
+        icons.dirty = true;
+        icons
+    }
+
+    fn request(name: &str, source: IconSource, px: i32, cached_key: Option<String>) -> IconRequest {
+        let (result, _) = sync_channel(1);
+        IconRequest {
+            generation: 1,
+            request_id: 1,
+            stamp: 1,
             px,
-            stamp,
-            path: Some(path),
-            pixels: HashMap::new(),
-            textures: HashMap::new(),
-            dirty: true,
+            name: name.to_string(),
+            source,
+            cached_key,
+            result,
         }
     }
 
-    /// A theme icon is filed under its own name, because the theme stamp is what validates it and
-    /// a name carries nothing else worth knowing.
-    #[test]
-    fn a_theme_icon_is_keyed_by_its_name_alone() {
-        assert_eq!(cache_key("firefox"), "firefox");
-        // Relative paths are not part of the desktop-entry contract and are treated as names, so
-        // they must not acquire a stamp either.
-        assert_eq!(cache_key("icons/thing.png"), "icons/thing.png");
+    fn write_test_png(path: &std::path::Path) {
+        let pixbuf =
+            gtk4::gdk_pixbuf::Pixbuf::new(gtk4::gdk_pixbuf::Colorspace::Rgb, true, 8, 2, 2)
+                .expect("test pixbuf");
+        pixbuf.fill(0x3366ccff);
+        std::fs::write(path, pixbuf.save_to_bufferv("png", &[]).expect("test PNG"))
+            .expect("write test PNG");
     }
 
-    /// An absolute path is the one entry the theme stamp cannot see, so it validates itself: the
-    /// key moves when the file does, and a rewritten icon is decoded again instead of being served
-    /// from the cache until something unrelated invalidates the whole file.
+    fn reset_source_counters() {
+        SOURCE_OPEN_COUNT.with(|count| count.set(0));
+        SOURCE_DECODE_COUNT.with(|count| count.set(0));
+    }
+
+    fn source_counters() -> (usize, usize) {
+        (
+            SOURCE_OPEN_COUNT.with(std::cell::Cell::get),
+            SOURCE_DECODE_COUNT.with(std::cell::Cell::get),
+        )
+    }
+
     #[test]
-    fn a_rewritten_icon_file_gets_a_new_key() {
+    fn cold_texture_lookup_does_no_source_or_decode_work() {
+        let mut icons = blank(tmp("cold-lookup"), 20, 7);
+        reset_source_counters();
+
+        assert!(icons.texture("firefox").is_none());
+        assert!(
+            icons
+                .texture("/nonexistent/cbar-launcher-test/icon.png")
+                .is_none()
+        );
+        assert_eq!(
+            source_counters(),
+            (0, 0),
+            "the GTK cache lookup must remain memory-only on every miss"
+        );
+    }
+
+    #[test]
+    fn a_rewritten_icon_file_gets_a_new_descriptor_key() {
         let path = tmp("rewritten").with_file_name("art.png");
         std::fs::write(&path, b"first").unwrap();
         let name = path.to_str().unwrap();
-        let first = cache_key(name);
-        assert_ne!(first, name, "an absolute path must carry its own stamp");
+        let first = absolute_cache_key(
+            name,
+            &std::fs::File::open(&path).unwrap().metadata().unwrap(),
+        );
+        assert_eq!(absolute_name_from_key(&first), Some(name));
 
-        // Two writes within one filesystem timestamp tick would be indistinguishable, which is a
-        // property of the clock rather than of this code -- so the file is given an explicitly
-        // different modification time rather than being raced against it.
         std::fs::write(&path, b"second").unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         std::fs::File::open(&path)
@@ -718,18 +1266,27 @@ mod tests {
             .unwrap();
 
         assert_ne!(
-            cache_key(name),
+            absolute_cache_key(
+                name,
+                &std::fs::File::open(&path).unwrap().metadata().unwrap()
+            ),
             first,
             "a file rewritten behind an unchanged path must miss the cache"
         );
     }
 
-    /// A path that names nothing is not asked about: the theme cannot hold an icon called
-    /// `/opt/thing/icon.png`, so falling through to it could only produce the missing-image glyph.
     #[test]
-    fn an_absolute_path_that_is_not_there_keeps_its_bare_name() {
+    fn an_absolute_path_that_is_not_there_is_a_worker_miss() {
         let missing = "/nonexistent/cbar-launcher-test/icon.png";
-        assert_eq!(cache_key(missing), missing);
+        assert!(matches!(
+            load_icon(&request(
+                missing,
+                IconSource::Absolute(PathBuf::from(missing)),
+                20,
+                None,
+            )),
+            LoadOutcome::Missing
+        ));
     }
 
     /// A file this program did not write, or wrote in an older shape, reads as "no cache" rather
@@ -860,23 +1417,104 @@ mod tests {
     }
 
     #[test]
-    fn absolute_icon_sources_are_regular_bounded_and_not_symlinked() {
+    fn absolute_icon_sources_are_regular_bounded_and_follow_ordinary_symlinks() {
         use std::os::unix::fs::symlink;
 
         let regular = tmp("absolute-regular");
         std::fs::write(&regular, b"not an image, but a bounded regular source").unwrap();
-        assert!(open_absolute_icon(&regular).is_some());
+        assert!(open_icon_source(&regular).is_some());
 
         let link = tmp("absolute-link");
         symlink(&regular, &link).unwrap();
-        assert!(open_absolute_icon(&link).is_none());
+        let (_, linked_metadata) = open_icon_source(&link).expect("ordinary symlink source");
+        assert_eq!(
+            linked_metadata.ino(),
+            std::fs::metadata(&regular).unwrap().ino(),
+            "fstat must describe the followed target descriptor"
+        );
 
         let huge = tmp("absolute-huge");
         std::fs::File::create(&huge)
             .unwrap()
             .set_len(MAX_ICON_SOURCE_BYTES + 1)
             .unwrap();
-        assert!(open_absolute_icon(&huge).is_none());
+        assert!(open_icon_source(&huge).is_none());
+    }
+
+    #[test]
+    fn legitimate_absolute_symlink_is_decoded_and_keyed_by_its_target_descriptor() {
+        use std::os::unix::fs::symlink;
+
+        let target = tmp("absolute-png-target").with_file_name("target.png");
+        write_test_png(&target);
+        let link = target.with_file_name("linked.png");
+        symlink(&target, &link).unwrap();
+        let name = link.to_string_lossy().into_owned();
+
+        let outcome = load_icon(&request(
+            &name,
+            IconSource::Absolute(link.clone()),
+            20,
+            None,
+        ));
+        let LoadOutcome::Decoded { key, pixels } = outcome else {
+            panic!("a legitimate absolute symlink did not decode");
+        };
+        assert_eq!(pixels.len(), 20 * 20 * 4);
+        assert_eq!(absolute_name_from_key(&key), Some(name.as_str()));
+        let target_metadata = std::fs::metadata(&target).unwrap();
+        assert!(key.contains(&format!(":{}:", target_metadata.ino())));
+
+        let replacement = target.with_file_name("replacement.png");
+        write_test_png(&replacement);
+        std::fs::remove_file(&link).unwrap();
+        symlink(&replacement, &link).unwrap();
+        let LoadOutcome::Decoded {
+            key: replacement_key,
+            ..
+        } = load_icon(&request(
+            &name,
+            IconSource::Absolute(link),
+            20,
+            Some(key.clone()),
+        ))
+        else {
+            panic!("retargeted symlink reused stale cached pixels");
+        };
+        assert_ne!(replacement_key, key);
+    }
+
+    #[test]
+    fn matching_absolute_descriptor_key_skips_read_and_decode() {
+        let path = tmp("absolute-cached-hit").with_file_name("cached.png");
+        write_test_png(&path);
+        let name = path.to_str().unwrap();
+        let metadata = std::fs::File::open(&path).unwrap().metadata().unwrap();
+        let key = absolute_cache_key(name, &metadata);
+        reset_source_counters();
+
+        assert!(matches!(
+            load_icon(&request(
+                name,
+                IconSource::Absolute(path.clone()),
+                20,
+                Some(key.clone()),
+            )),
+            LoadOutcome::Cached { key: found } if found == key
+        ));
+        assert_eq!(
+            source_counters(),
+            (1, 0),
+            "validation opens and fstats once but must not read or decode a cache hit"
+        );
+    }
+
+    #[test]
+    fn icon_worker_count_is_hardware_derived_and_bounded() {
+        assert_eq!(icon_worker_count(None), 1);
+        assert_eq!(icon_worker_count(Some(1)), 1);
+        assert_eq!(icon_worker_count(Some(8)), 4);
+        assert_eq!(icon_worker_count(Some(8_192)), MAX_ICON_WORKERS);
     }
 
     #[test]
@@ -918,6 +1556,65 @@ mod tests {
                 .pixels
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn completion_requires_matching_generation_request_theme_and_size() {
+        let icons = blank(tmp("completion-generation"), 20, 91);
+        let pending = PendingIcon {
+            request_id: 7,
+            request: None,
+            waiters: Vec::new(),
+            started: Instant::now(),
+            absolute: true,
+        };
+        let current = IconResult {
+            generation: icons.generation,
+            request_id: 7,
+            stamp: 91,
+            px: 20,
+            name: "/tmp/icon.png".to_string(),
+            absolute: true,
+            outcome: LoadOutcome::Missing,
+        };
+        assert!(icons.result_is_current(&current, &pending));
+
+        for stale in [
+            IconResult {
+                generation: icons.generation.wrapping_add(1),
+                ..current_result_like(&current)
+            },
+            IconResult {
+                request_id: 8,
+                ..current_result_like(&current)
+            },
+            IconResult {
+                stamp: 92,
+                ..current_result_like(&current)
+            },
+            IconResult {
+                px: 24,
+                ..current_result_like(&current)
+            },
+            IconResult {
+                absolute: false,
+                ..current_result_like(&current)
+            },
+        ] {
+            assert!(!icons.result_is_current(&stale, &pending));
+        }
+    }
+
+    fn current_result_like(result: &IconResult) -> IconResult {
+        IconResult {
+            generation: result.generation,
+            request_id: result.request_id,
+            stamp: result.stamp,
+            px: result.px,
+            name: result.name.clone(),
+            absolute: result.absolute,
+            outcome: LoadOutcome::Missing,
+        }
     }
 
     #[test]
