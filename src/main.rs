@@ -21,7 +21,7 @@ use smithay_client_toolkit::output::OutputInfo;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot::Sender;
 use tokio::task::{JoinHandle, block_in_place};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::bar::{Bar, create_bar};
 use crate::channels::SyncSenderExt;
@@ -225,20 +225,25 @@ impl Ironbar {
 
             running.store(true, Ordering::Relaxed);
 
-            cfg_if! {
-                if #[cfg(feature = "ipc")] {
-                    let ipc = ipc::Ipc::new().unwrap_or_else(|err| {
-                        error!("{err:#}");
-                        exit(ExitCode::IpcResponseError as i32)
-                    });
+            #[cfg(feature = "ipc")]
+            let ipc_path = match ipc::Ipc::new() {
+                Ok(ipc) => {
+                    let path = ipc.path().to_path_buf();
                     ipc.start(app, instance.clone());
+                    Some(path)
                 }
-            }
+                Err(err) => {
+                    // IPC is optional control-plane functionality. A session without a secure
+                    // runtime directory must still be able to display the bar; silently falling
+                    // back to a shared temporary directory would trade compatibility for an
+                    // unsafe socket instead.
+                    warn!("IPC unavailable; continuing without it: {err:#}");
+                    None
+                }
+            };
 
             load_css(&css_source);
 
-            #[cfg(feature = "ipc")]
-            let ipc_path = ipc.path().to_path_buf();
             spawn(async move {
                 tokio::signal::ctrl_c()
                     .await
@@ -247,7 +252,9 @@ impl Ironbar {
                 info!("Shutting down");
 
                 #[cfg(feature = "ipc")]
-                ipc::Ipc::shutdown(ipc_path);
+                if let Some(ipc_path) = ipc_path {
+                    ipc::Ipc::shutdown(ipc_path);
+                }
 
                 exit(0);
             });
