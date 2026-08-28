@@ -159,14 +159,10 @@ fn quote_i3_argument(value: &str) -> Result<String, Report> {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('"');
     for character in value.chars() {
-        match character {
-            '"' | '\\' => {
-                quoted.push('\\');
-                quoted.push(character);
-            }
-            '$' => quoted.push_str("$$"),
-            character => quoted.push(character),
+        if matches!(character, '"' | '\\') {
+            quoted.push('\\');
         }
+        quoted.push(character);
     }
     quoted.push('"');
     Ok(quoted)
