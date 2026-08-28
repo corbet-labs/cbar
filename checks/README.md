@@ -11,7 +11,8 @@ The launcher assertion uses its opt-in progress trace plus the ordinary IPC stat
 layout assertion uses `CBAR_LAYOUT_TRACE=1` to read GTK's final widget allocations, avoiding a
 font- and theme-sensitive screenshot comparison. Neither trace is active in an ordinary session.
 
-The harness does not install or pin a compositor. Pass an exact compositor argv after `--`; an
+The harness does not install or pin a compositor. Its input-driver argument must implement wtype's
+named-key and sleep options (`-P`, `-p`, and `-s`). Pass an exact compositor argv after `--`; an
 argument equal to `{config}` is replaced with the generated Sway-compatible fixture config:
 
 ```sh

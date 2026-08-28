@@ -7,7 +7,7 @@
 # around either without making one compositor a package or repository dependency.
 #
 # Usage:
-#   checks/headless-session.sh <cbar> <input-driver> -- <compositor> [arguments...]
+#   checks/headless-session.sh <cbar> <wtype-compatible-input-driver> -- <compositor> [arguments...]
 # Example:
 #   checks/headless-session.sh target/debug/ironbar wtype -- scroll -c '{config}'
 set -euo pipefail
@@ -181,6 +181,7 @@ shift 3
 compositor=("$@")
 bar_pid=
 compositor_pid=
+input_keeper_pid=
 
 stop_process() {
     local pid=${1:-}
@@ -198,6 +199,7 @@ stop_process() {
 
 cleanup_session() {
     set +e
+    stop_process "$input_keeper_pid" TERM
     stop_process "$bar_pid" INT
     stop_process "$compositor_pid" TERM
 }
@@ -214,6 +216,7 @@ export XDG_STATE_HOME=$rig/state
 export XDG_CACHE_HOME=$rig/cache
 export GSETTINGS_BACKEND=memory
 export GDK_BACKEND=wayland
+export GIO_USE_VFS=local
 export WLR_BACKENDS=headless
 export WLR_RENDERER=pixman
 export WLR_HEADLESS_OUTPUTS=1
@@ -236,6 +239,14 @@ for _ in $(seq 1 150); do
 done
 [[ -n $wayland_display ]] || fail "compositor never created a Wayland socket"
 export WAYLAND_DISPLAY=$wayland_display
+
+# A headless seat starts without a physical keyboard. Keep one neutral virtual keyboard object
+# alive for the session so the compositor establishes keyboard focus before the layer surface maps;
+# a one-shot injector created only after map can disappear before that seat transition is applied.
+"$input_driver" -P Shift_L -p Shift_L -s 45000 >"$rig/input-keeper.log" 2>&1 &
+input_keeper_pid=$!
+sleep 0.1
+kill -0 "$input_keeper_pid" 2>/dev/null || fail "input driver could not keep a virtual keyboard alive"
 
 CBAR_LAYOUT_TRACE=1 \
 CBAR_LAUNCHER_TRACE=1 \
@@ -278,6 +289,10 @@ count_preparation_finishes() {
     grep -c 'cbar-launcher-owner-trace prepare-finish ' "$rig/cbar.log" 2>/dev/null || true
 }
 
+count_cancel_keys() {
+    grep -c 'cbar-launcher-trace cancel-key$' "$rig/cbar.log" 2>/dev/null || true
+}
+
 wait_for_counter_above() {
     local counter=$1
     local before=$2
@@ -309,7 +324,9 @@ sleep 0.5
 # Escape is handled inside the launcher window. It must also update the outer resident owner's
 # desired state; otherwise the next completed async preparation maps the window behind the user's
 # back. Waiting for a traced preparation completion makes this a deterministic race assertion.
-"$input_driver" -k Escape
+cancel_before=$(count_cancel_keys)
+"$input_driver" -P Escape -s 50 -p Escape
+wait_for_counter_above count_cancel_keys "$cancel_before" "Escape delivery"
 wait_for_status resident "Escape dismissal"
 prepare_before=$(count_preparation_finishes)
 "$cbar" launcher refresh >/dev/null

@@ -2458,6 +2458,11 @@ fn build(
                 mods.contains(ModifierType::SUPER_MASK),
             );
             let act = keys_map.action(&chord);
+            if matches!(act, Some(keymap::Action::Cancel)) {
+                // Do not trace arbitrary key names or text. The headless lifecycle check only
+                // needs to prove that its synthetic dismissal reached GTK's key controller.
+                trace(format_args!("cancel-key"));
+            }
             let structural;
             {
                 let mut s = state.borrow_mut();
