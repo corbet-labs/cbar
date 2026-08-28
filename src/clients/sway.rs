@@ -736,10 +736,9 @@ impl Client {
                     if state.supervisors[event_type.index()]
                         .as_ref()
                         .is_some_and(|supervisor| supervisor.registrations.is_closed())
+                        && let Some(supervisor) = state.supervisors[event_type.index()].take()
                     {
-                        if let Some(supervisor) = state.supervisors[event_type.index()].take() {
-                            supervisor.join_handle.abort();
-                        }
+                        supervisor.join_handle.abort();
                     }
                 }
             }
