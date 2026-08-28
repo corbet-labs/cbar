@@ -1151,6 +1151,7 @@ fn build(
             "none" => KeyboardMode::None,
             _ => KeyboardMode::Exclusive,
         });
+        trace(format_args!("surface=layer-shell keyboard={keyboard_mode}"));
     }
 
     let provider = CssProvider::new();

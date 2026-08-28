@@ -43,7 +43,7 @@ command_exists "${COMPOSITOR_ARGV[0]}" || {
     printf 'no compositor: %s\n' "${COMPOSITOR_ARGV[0]}" >&2
     exit 2
 }
-for dependency in bash dbus-run-session python3; do
+for dependency in bash dbus-run-session python3 setsid; do
     command_exists "$dependency" || { printf 'missing dependency: %s\n' "$dependency" >&2; exit 2; }
 done
 
@@ -182,26 +182,81 @@ compositor=("$@")
 bar_pid=
 compositor_pid=
 input_keeper_pid=
+input_injector_pid=
 
-stop_process() {
+process_group_alive() {
+    local group=${1:-}
+    [[ $group =~ ^[1-9][0-9]*$ ]] && kill -0 -- "-$group" 2>/dev/null
+}
+
+reap_if_exited() {
     local pid=${1:-}
-    local signal=${2:-TERM}
-    [[ -n $pid ]] || return 0
-    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
-    kill -"$signal" "$pid" 2>/dev/null || true
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 0
+    # `wait` is used only after the kernel says the direct child no longer exists, so it cannot
+    # become an unbounded cleanup wait. Descendants are handled through the process group below.
+    if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+stop_process_group() {
+    local group=${1:-}
+    [[ $group =~ ^[1-9][0-9]*$ ]] || return 0
+    if ! process_group_alive "$group"; then
+        reap_if_exited "$group"
+        return 0
+    fi
+
+    kill -TERM -- "-$group" 2>/dev/null || true
     for _ in $(seq 1 40); do
-        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
+        reap_if_exited "$group"
+        process_group_alive "$group" || return 0
         sleep 0.05
     done
-    kill -TERM "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+
+    kill -KILL -- "-$group" 2>/dev/null || true
+    for _ in $(seq 1 40); do
+        reap_if_exited "$group"
+        process_group_alive "$group" || return 0
+        sleep 0.05
+    done
+    printf 'cleanup could not stop process group %s\n' "$group" >&2
+    return 1
+}
+
+wait_for_process() {
+    local pid=$1
+    local label=$2
+    local status
+    for _ in $(seq 1 100); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            # The failed liveness probe proves this wait is non-blocking.
+            if wait "$pid"; then
+                return 0
+            else
+                status=$?
+                return "$status"
+            fi
+        fi
+        sleep 0.05
+    done
+    stop_process_group "$pid" || true
+    fail "$label timed out"
 }
 
 cleanup_session() {
+    local session_status=$?
+    local cleanup_status=0
+    trap - EXIT
     set +e
-    stop_process "$input_keeper_pid" TERM
-    stop_process "$bar_pid" INT
-    stop_process "$compositor_pid" TERM
+    stop_process_group "$input_injector_pid" || cleanup_status=1
+    stop_process_group "$input_keeper_pid" || cleanup_status=1
+    stop_process_group "$bar_pid" || cleanup_status=1
+    stop_process_group "$compositor_pid" || cleanup_status=1
+    if (( session_status != 0 )); then
+        exit "$session_status"
+    fi
+    exit "$cleanup_status"
 }
 trap cleanup_session EXIT
 
@@ -221,9 +276,10 @@ export WLR_BACKENDS=headless
 export WLR_RENDERER=pixman
 export WLR_HEADLESS_OUTPUTS=1
 export WLR_LIBINPUT_NO_DEVICES=1
-unset HOME WAYLAND_DISPLAY SWAYSOCK SCROLLSOCK I3SOCK DISPLAY
+unset HOME WAYLAND_DISPLAY WAYLAND_SOCKET SWAYSOCK SCROLLSOCK I3SOCK NIRI_SOCKET \
+    HYPRLAND_INSTANCE_SIGNATURE DISPLAY CBAR_LAUNCHER_NO_LAYER
 
-"${compositor[@]}" >"$rig/compositor.log" 2>&1 &
+setsid -- "${compositor[@]}" >"$rig/compositor.log" 2>&1 &
 compositor_pid=$!
 
 wayland_display=
@@ -234,7 +290,7 @@ for _ in $(seq 1 150); do
             break 2
         fi
     done
-    kill -0 "$compositor_pid" 2>/dev/null || fail "compositor exited before creating a Wayland socket"
+    process_group_alive "$compositor_pid" || fail "compositor exited before creating a Wayland socket"
     sleep 0.1
 done
 [[ -n $wayland_display ]] || fail "compositor never created a Wayland socket"
@@ -243,10 +299,10 @@ export WAYLAND_DISPLAY=$wayland_display
 # A headless seat starts without a physical keyboard. Keep one neutral virtual keyboard object
 # alive for the session so the compositor establishes keyboard focus before the layer surface maps;
 # a one-shot injector created only after map can disappear before that seat transition is applied.
-"$input_driver" -P Shift_L -p Shift_L -s 45000 >"$rig/input-keeper.log" 2>&1 &
+setsid -- "$input_driver" -P Shift_L -p Shift_L -s 180000 >"$rig/input-keeper.log" 2>&1 &
 input_keeper_pid=$!
 sleep 0.1
-kill -0 "$input_keeper_pid" 2>/dev/null || fail "input driver could not keep a virtual keyboard alive"
+process_group_alive "$input_keeper_pid" || fail "input driver could not keep a virtual keyboard alive"
 
 CBAR_LAYOUT_TRACE=1 \
 CBAR_LAUNCHER_TRACE=1 \
@@ -254,12 +310,12 @@ CBAR_LAUNCHER_CONFIG="$rig/launcher.json" \
 CBAR_LAUNCHER_CACHE="$rig/cache/cbar/launcher/inventory" \
 IRONBAR_CONFIG="$rig/bar.toml" \
 IRONBAR_CSS="$rig/bar.css" \
-"$cbar" >"$rig/cbar.log" 2>&1 &
+setsid -- "$cbar" >"$rig/cbar.log" 2>&1 &
 bar_pid=$!
 
 for _ in $(seq 1 150); do
     [[ -S $rig/ironbar-ipc.sock ]] && break
-    kill -0 "$bar_pid" 2>/dev/null || fail "cbar exited before creating its IPC socket"
+    process_group_alive "$bar_pid" || fail "cbar exited before creating its IPC socket"
     sleep 0.1
 done
 [[ -S $rig/ironbar-ipc.sock ]] || fail "cbar never created its IPC socket"
@@ -275,7 +331,7 @@ wait_for_status() {
     for _ in $(seq 1 100); do
         value=$(launcher_status || true)
         [[ $value == "$expected" ]] && return 0
-        kill -0 "$bar_pid" 2>/dev/null || fail "cbar exited while waiting for $label"
+        process_group_alive "$bar_pid" || fail "cbar exited while waiting for $label"
         sleep 0.1
     done
     fail "$label: expected launcher status $expected, got ${value:-<none>}"
@@ -293,6 +349,10 @@ count_cancel_keys() {
     grep -c 'cbar-launcher-trace cancel-key$' "$rig/cbar.log" 2>/dev/null || true
 }
 
+count_layer_shell_selections() {
+    grep -c 'cbar-launcher-trace surface=layer-shell ' "$rig/cbar.log" 2>/dev/null || true
+}
+
 wait_for_counter_above() {
     local counter=$1
     local before=$2
@@ -301,7 +361,7 @@ wait_for_counter_above() {
     for _ in $(seq 1 100); do
         current=$($counter)
         (( current > before )) && return 0
-        kill -0 "$bar_pid" 2>/dev/null || fail "cbar exited while waiting for $label"
+        process_group_alive "$bar_pid" || fail "cbar exited while waiting for $label"
         sleep 0.1
     done
     fail "$label did not complete (counter stayed at $current)"
@@ -310,6 +370,7 @@ wait_for_counter_above() {
 # Warmup must build one hidden resident UI before the race test starts. This makes the first show a
 # true resident map and lets the refresh below exercise replacement/visibility ownership directly.
 wait_for_status resident "launcher warmup"
+wait_for_counter_above count_layer_shell_selections 0 "layer-shell selection"
 
 prepare_before=$(count_preparation_finishes)
 "$cbar" launcher show >/dev/null
@@ -325,7 +386,17 @@ sleep 0.5
 # desired state; otherwise the next completed async preparation maps the window behind the user's
 # back. Waiting for a traced preparation completion makes this a deterministic race assertion.
 cancel_before=$(count_cancel_keys)
-"$input_driver" -P Escape -s 50 -p Escape
+process_group_alive "$input_keeper_pid" || fail "virtual keyboard keeper exited before Escape"
+setsid -- "$input_driver" -P Escape -s 50 -p Escape >"$rig/input-injector.log" 2>&1 &
+input_injector_pid=$!
+if wait_for_process "$input_injector_pid" "Escape input"; then
+    input_status=0
+else
+    input_status=$?
+fi
+stop_process_group "$input_injector_pid" || fail "Escape input leaked process-group members"
+input_injector_pid=
+(( input_status == 0 )) || fail "Escape input exited with status $input_status"
 wait_for_counter_above count_cancel_keys "$cancel_before" "Escape delivery"
 wait_for_status resident "Escape dismissal"
 prepare_before=$(count_preparation_finishes)
@@ -390,6 +461,8 @@ ex, _, ew, _ = end
 failures = []
 if bw <= 0 or bh <= 0 or cw <= 0:
     failures.append(f"non-positive allocation: bar={bar} center={center}")
+if bx != 0 or bw != 1920:
+    failures.append(f"bar did not span the deterministic 1920px output: bar={bar}")
 if sw - ew < 250:
     failures.append(f"fixture was not materially asymmetric: start={sw}px end={ew}px")
 
