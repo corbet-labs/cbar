@@ -27,6 +27,12 @@ Nixdesktop and a private `desktop.nix` may supply personal policy, but cbar also
 builds and runs without Nix. Public tests exercise absent, minimal and multiple
 devices, arbitrary provider names and small through large machine sets.
 
+Cbar's supported-user floor is Ironbar's current supported-user set. Existing
+compositors, architectures, distributions, configuration formats, modules and
+Cargo feature combinations remain supported. New integrated functionality is
+additive and cannot make Nix, remote machines, a particular compositor or
+specialised hardware a runtime requirement.
+
 ## First release boundary
 
 The first release owns:
@@ -118,6 +124,13 @@ without that hardware.
 
 ## Compositor integration
 
+Cbar is compositor neutral. Compositor-specific behaviour stays behind the
+existing adapter boundary, and generic UI, launcher and graph code does not
+invoke compositor-specific commands. Sway/Scroll, Hyprland and Niri support
+must not regress; a missing adapter disables only the capability it provides.
+GTK/GDK and standard Wayland protocols are preferred where they express the
+required operation.
+
 Scroll support belongs at the typed swayipc boundary. Horizontal and vertical
 layout aliases are accepted by the dependency's node-layout type. Cbar does not
 ship an IPC proxy or rewrite raw protocol messages.
@@ -134,9 +147,10 @@ peer user. Persistent launcher state is atomic, mode `0600`, size bounded and
 opened without following symlinks. Desktop entries become argument vectors;
 they are never interpolated into a shell command.
 
-The opinionated build excludes arbitrary Lua and script execution unless the
-operator explicitly enables the upstream-compatible features. Runtime
-hardening is applied to cbar itself, not inherited by launched applications.
+Ironbar's Lua, Cairo and script extension points remain available in the
+upstream-compatible build. Runtime hardening must preserve them rather than
+silently narrowing the supported user set. Hardening is applied to cbar itself,
+not inherited by launched applications.
 
 ## Configuration ownership
 
