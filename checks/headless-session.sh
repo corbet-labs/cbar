@@ -394,6 +394,7 @@ require_resident_quiet_window() {
     # One full second is comfortably longer than the headless map/configure/present round trip.
     # Poll throughout it: a single sleep followed by one observation could miss a transient reopen.
     for _ in $(seq 1 20); do
+        sleep 0.05
         status=$(launcher_status || true)
         maps=$(count_launcher_maps)
         [[ $status == resident ]] ||
@@ -401,7 +402,6 @@ require_resident_quiet_window() {
         (( maps == expected_maps )) ||
             fail "$label: launcher map count changed from $expected_maps to $maps"
         process_group_alive "$bar_pid" || fail "cbar exited during $label"
-        sleep 0.05
     done
     printf 'launcher quiet_ms=1000 maps=%s status=resident\n' "$expected_maps"
 }
