@@ -159,10 +159,13 @@ impl Launcher {
         if let Some(display) = self.display.borrow().as_ref() {
             return Some(display.clone());
         }
-        // A separate connection gives the embedded Golden Master a separate CSS provider domain;
-        // the default display is retained only as a portability fallback when a backend refuses a
-        // second connection. No display is opened at all for an unconfigured launcher.
-        let display = gtk::gdk::Display::open(None).or_else(gtk::gdk::Display::default)?;
+        // gtk4-layer-shell owns one process-global layer-shell proxy bound to the first Wayland
+        // display which initializes it. cbar's bar has already done that, so a launcher wl_surface
+        // from a second GDK connection would be passed to a proxy from the first connection and the
+        // compositor must reject the cross-connection request. Embedded layer surfaces therefore
+        // share the application's default display. Launcher CSS remains isolated by its scoped
+        // selectors, explicit reset, and USER+1 priority in cbar-launcher.
+        let display = gtk::gdk::Display::default()?;
         self.display.replace(Some(display.clone()));
         Some(display)
     }

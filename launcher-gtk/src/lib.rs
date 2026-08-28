@@ -1115,10 +1115,9 @@ fn build(
     let window = ApplicationWindow::builder()
         .application(application)
         .build();
-    // Ironbar's user CSS provider is display-global. A second backend connection is the only
-    // complete two-way isolation for arbitrary valid selectors (`*`, `scrollbar`, `button`, ...):
-    // selector resets cannot reconstruct the native theme after a higher-priority user rule.
-    // This remains one cbar process/application; only the launcher's GDK connection is isolated.
+    // The embedded launcher must use cbar's default display because gtk4-layer-shell has one
+    // process-global Wayland proxy. The scoped USER+1 provider and explicit reset above isolate the
+    // standalone Golden Master styling while keeping every layer surface on that one connection.
     window.set_display(display);
     window.add_css_class("cbar-launcher");
 
