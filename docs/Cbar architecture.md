@@ -104,6 +104,18 @@ not spawn a shell or enter Lua for every source and frame. Sampling cadence and
 drawing cadence are independent: an unchanged or hidden graph does not force a
 new sample or redraw.
 
+Bar placement follows the information's time semantics:
+
+- navigation and actions belong at the start;
+- runtime quantities whose history is the useful information belong in the
+  centre; and
+- snapshot state that needs only a current value belongs at the end.
+
+The system-history canvas is therefore centred as one responsive cluster.
+Surplus allocation is split symmetrically around the fitted cluster rather than
+left aligned inside the centre zone. A missing capability consumes no cell,
+divider or residual width.
+
 Graph priority is:
 
 1. CPU
