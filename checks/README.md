@@ -1,7 +1,8 @@
 # Headless integration checks
 
 `release-matrix.sh` is the executable release gate. `--source-only` runs the
-complete Rust, package, and Nix matrix. A release candidate must instead pass a
+complete Rust, every upstream-supported individual feature, package, and Nix
+matrix. A release candidate must instead pass a
 wtype-compatible input driver and a real Sway-compatible compositor, which adds
 the layer-shell lifecycle and geometry acceptance below:
 

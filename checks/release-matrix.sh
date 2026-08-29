@@ -31,6 +31,11 @@ step() {
     printf 'release-gate=%s\n' "$1"
 }
 
+# Sparse feature builds intentionally leave neighbouring module code unused.
+# Preserve upstream's narrow exemptions while still rejecting every other
+# compiler warning; the all-feature Clippy gate below remains fully strict.
+sparse_rustflags='-Dwarnings -A unused-imports -A unused-variables -A unused-mut -A unused-macros -A dead-code'
+
 step format
 cargo fmt --all -- --check
 
@@ -44,7 +49,60 @@ step clippy-all-targets-features
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 step check-no-default-features
-cargo check --no-default-features --locked
+RUSTFLAGS="$sparse_rustflags" cargo check --no-default-features --locked
+
+# Keep the upstream-supported single-feature surface executable in this one
+# authoritative gate. An all-feature build cannot expose cfg/dependency holes
+# which appear only when neighbouring modules are absent.
+feature_checks=(
+    http
+    ipc
+    inhibit
+    cli
+    config+all
+    config+json
+    config+yaml
+    config+toml
+    config+corn
+    battery
+    bindmode+all
+    bindmode+sway
+    bindmode+hyprland
+    bluetooth
+    brightness
+    cairo
+    clipboard
+    clock
+    custom
+    focused
+    keyboard+all
+    keyboard+sway
+    keyboard+hyprland
+    label
+    launcher
+    matrix_launcher
+    menu
+    music+all
+    music+mpris
+    music+mpd
+    network_manager
+    notifications
+    sys_info
+    script
+    system_graph
+    tray
+    volume
+    workspaces+all
+    workspaces+sway
+    workspaces+hyprland
+    workspaces+niri
+    extras
+)
+for feature in "${feature_checks[@]}"; do
+    step "check-feature-$feature"
+    RUSTFLAGS="$sparse_rustflags" \
+        cargo check --no-default-features --features "$feature" --locked
+done
 
 step check-matrix-launcher
 cargo check --no-default-features --features matrix_launcher --locked
