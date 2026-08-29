@@ -292,6 +292,7 @@ export WLR_BACKENDS=headless
 export WLR_RENDERER=pixman
 export WLR_HEADLESS_OUTPUTS=1
 export WLR_LIBINPUT_NO_DEVICES=1
+export GSK_RENDERER=cairo
 unset HOME WAYLAND_DISPLAY WAYLAND_SOCKET SWAYSOCK SCROLLSOCK I3SOCK NIRI_SOCKET \
     HYPRLAND_INSTANCE_SIGNATURE DISPLAY CBAR_LAUNCHER_NO_LAYER
 
@@ -522,7 +523,8 @@ graph_redraws=$(( $(count_graph_redraws) - graph_redraws_before ))
 
 python3 - "$rig/performance.json" \
     "$startup_to_layout_ms" "$resident_rss_kib" "$idle_window_ms" "$idle_cpu_ms" \
-    "$graph_samples" "$graph_redraws" "${compositor[0]}" "$cbar" "$clock_ticks" <<'PY'
+    "$graph_samples" "$graph_redraws" "${compositor[0]}" "$cbar" "$clock_ticks" \
+    "$rig/compositor.conf" "${compositor[@]}" <<'PY'
 import hashlib
 import json
 import os
@@ -541,6 +543,11 @@ metrics = {
 }
 compositor = shutil.which(sys.argv[8]) or sys.argv[8]
 binary = shutil.which(sys.argv[9]) or sys.argv[9]
+generated_config = sys.argv[11]
+compositor_argv = [os.path.realpath(compositor)]
+compositor_argv.extend(
+    "{config}" if argument == generated_config else argument for argument in sys.argv[13:]
+)
 cpu_model = "unknown"
 try:
     for line in pathlib.Path("/proc/cpuinfo").read_text(
@@ -556,15 +563,17 @@ context = {
     "architecture": os.uname().machine,
     "binary_profile": pathlib.Path(os.path.realpath(binary)).parent.name,
     "clock_ticks": int(sys.argv[10]),
+    "compositor_argv": compositor_argv,
     "compositor_executable": os.path.realpath(compositor),
+    "compositor_renderer": "pixman",
     "cpu_model": cpu_model,
     "gdk_backend": "wayland",
     "graph_sample_interval_ms": 500,
+    "gtk_renderer": "cairo",
     "kernel_release": os.uname().release,
     "logical_cpus": os.cpu_count(),
     "output_mode": "1920x1080",
     "page_size": os.sysconf("SC_PAGE_SIZE"),
-    "renderer": "pixman",
 }
 encoded_context = json.dumps(context, sort_keys=True, separators=(",", ":")).encode()
 record = {
