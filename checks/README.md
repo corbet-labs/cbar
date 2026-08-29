@@ -1,5 +1,18 @@
 # Headless integration checks
 
+`release-matrix.sh` is the executable release gate. `--source-only` runs the
+complete Rust, package, and Nix matrix. A release candidate must instead pass a
+wtype-compatible input driver and a real Sway-compatible compositor, which adds
+the layer-shell lifecycle and geometry acceptance below:
+
+```sh
+checks/release-matrix.sh wtype -- scroll -c '{config}'
+```
+
+The caller may set `CARGO_TARGET_DIR`; build orchestration should put it on a
+filesystem with enough capacity rather than relying on a small temporary
+filesystem.
+
 `headless-session.sh` starts cbar inside a private, headless Wayland session. It proves two
 layer-surface contracts that unit tests cannot observe:
 
