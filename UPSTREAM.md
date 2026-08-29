@@ -13,10 +13,11 @@ features are additive. A release must pass the compatibility and regression
 gates documented in `docs/Cbar architecture.md` before it is published.
 
 Repository, package, application, and release identities are intentionally
-separate from upstream ownership. The final public identity is not assigned in
-this working tree yet. Every Cargo package therefore has `publish = false`;
-publication is enabled only after the final package names, repository metadata,
-and release ownership are assigned together.
+separate from upstream ownership. The public product is `corbet-labs/cbar`, its
+binary and service are both named `cbar`, and its application ID is
+`ch.corbet.cbar`. Every Cargo package remains `publish = false`; releases are
+distributed as repository artifacts and Nix packages until crate publication
+is evaluated separately.
 
 ## Synchronising upstream
 

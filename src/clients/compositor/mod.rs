@@ -29,6 +29,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compositor {
     #[cfg(feature = "sway")]
+    Scroll,
+    #[cfg(feature = "sway")]
     Sway,
     #[cfg(feature = "sway")]
     I3,
@@ -45,6 +47,8 @@ impl Display for Compositor {
             f,
             "{}",
             match self {
+                #[cfg(any(feature = "sway"))]
+                Self::Scroll => "Scroll",
                 #[cfg(any(feature = "sway"))]
                 Self::Sway => "Sway",
                 #[cfg(feature = "sway")]
@@ -64,12 +68,14 @@ impl Compositor {
     /// This is done by checking system env vars.
     pub(crate) fn current() -> Self {
         if let Some(compositor) = sway_ipc_compositor_from_values(
+            std::env::var_os("SCROLLSOCK"),
             std::env::var_os("SWAYSOCK"),
             std::env::var_os("I3SOCK"),
         ) {
             cfg_if! {
                 if #[cfg(feature = "sway")] {
                     match compositor {
+                        SwayIpcCompositor::Scroll => Self::Scroll,
                         SwayIpcCompositor::Sway => Self::Sway,
                         SwayIpcCompositor::I3 => Self::I3,
                     }
@@ -102,7 +108,7 @@ impl Compositor {
     pub(crate) const fn supports_keyboard_layout_client(&self) -> bool {
         match self {
             #[cfg(feature = "keyboard+sway")]
-            Self::Sway => true,
+            Self::Scroll | Self::Sway => true,
             #[cfg(feature = "keyboard+hyprland")]
             Self::Hyprland => true,
             _ => false,
@@ -113,7 +119,7 @@ impl Compositor {
     pub(crate) const fn supports_workspace_client(&self) -> bool {
         match self {
             #[cfg(feature = "workspaces+sway")]
-            Self::Sway | Self::I3 => true,
+            Self::Scroll | Self::Sway | Self::I3 => true,
             #[cfg(feature = "workspaces+hyprland")]
             Self::Hyprland => true,
             #[cfg(feature = "workspaces+niri")]
@@ -126,7 +132,7 @@ impl Compositor {
     pub(crate) const fn supports_bindmode_client(&self) -> bool {
         match self {
             #[cfg(feature = "bindmode+sway")]
-            Self::Sway | Self::I3 => true,
+            Self::Scroll | Self::Sway | Self::I3 => true,
             #[cfg(feature = "bindmode+hyprland")]
             Self::Hyprland => true,
             _ => false,
@@ -141,7 +147,7 @@ impl Compositor {
         debug!("Getting keyboard_layout client for: {current}");
         match current {
             #[cfg(feature = "bindmode+sway")]
-            Self::Sway | Self::I3 => {
+            Self::Scroll | Self::Sway | Self::I3 => {
                 debug_assert!(current.supports_bindmode_client());
                 Ok(clients.sway().map_err(|err| Error::Other(err.into()))?)
             }
@@ -166,7 +172,7 @@ impl Compositor {
         debug!("Getting keyboard_layout client for: {current}");
         match current {
             #[cfg(feature = "keyboard+sway")]
-            Self::Sway => {
+            Self::Scroll | Self::Sway => {
                 debug_assert!(current.supports_keyboard_layout_client());
                 Ok(clients.sway().map_err(|err| Error::Other(err.into()))?)
             }
@@ -198,7 +204,7 @@ impl Compositor {
         debug!("Getting workspace client for: {current}");
         match current {
             #[cfg(feature = "workspaces+sway")]
-            Self::Sway | Self::I3 => {
+            Self::Scroll | Self::Sway | Self::I3 => {
                 debug_assert!(current.supports_workspace_client());
                 Ok(clients.sway().map_err(|err| Error::Other(err.into()))?)
             }
@@ -224,15 +230,19 @@ impl Compositor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SwayIpcCompositor {
+    Scroll,
     Sway,
     I3,
 }
 
 fn sway_ipc_compositor_from_values(
+    scrollsock: Option<OsString>,
     swaysock: Option<OsString>,
     i3sock: Option<OsString>,
 ) -> Option<SwayIpcCompositor> {
-    if swaysock.is_some_and(|path| !path.is_empty()) {
+    if scrollsock.is_some_and(|path| !path.is_empty()) {
+        Some(SwayIpcCompositor::Scroll)
+    } else if swaysock.is_some_and(|path| !path.is_empty()) {
         Some(SwayIpcCompositor::Sway)
     } else if i3sock.is_some_and(|path| !path.is_empty()) {
         Some(SwayIpcCompositor::I3)
@@ -246,20 +256,33 @@ mod compositor_detection_tests {
     use super::*;
 
     #[test]
-    fn sway_socket_wins_and_i3_socket_remains_a_distinct_runtime() {
+    fn compositor_socket_precedence_preserves_scroll_sway_and_i3_identity() {
         assert_eq!(
             sway_ipc_compositor_from_values(
+                Some(OsString::from("/run/scroll.sock")),
+                Some(OsString::from("/run/sway.sock")),
+                Some(OsString::from("/run/i3.sock")),
+            ),
+            Some(SwayIpcCompositor::Scroll)
+        );
+        assert_eq!(
+            sway_ipc_compositor_from_values(
+                None,
                 Some(OsString::from("/run/sway.sock")),
                 Some(OsString::from("/run/i3.sock")),
             ),
             Some(SwayIpcCompositor::Sway)
         );
         assert_eq!(
-            sway_ipc_compositor_from_values(None, Some(OsString::from("/run/i3.sock"))),
+            sway_ipc_compositor_from_values(None, None, Some(OsString::from("/run/i3.sock")),),
             Some(SwayIpcCompositor::I3)
         );
         assert_eq!(
-            sway_ipc_compositor_from_values(Some(OsString::new()), Some(OsString::new())),
+            sway_ipc_compositor_from_values(
+                Some(OsString::new()),
+                Some(OsString::new()),
+                Some(OsString::new()),
+            ),
             None
         );
     }
@@ -268,6 +291,7 @@ mod compositor_detection_tests {
     #[test]
     fn i3_does_not_advertise_sway_keyboard_layout_extensions() {
         assert!(!Compositor::I3.supports_keyboard_layout_client());
+        assert!(Compositor::Scroll.supports_keyboard_layout_client());
         assert!(Compositor::Sway.supports_keyboard_layout_client());
     }
 

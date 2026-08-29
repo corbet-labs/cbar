@@ -349,7 +349,7 @@ dependencies = [
  "dirs",
  "gtk4",
  "gtk4-layer-shell",
- "ironbar-launch-service",
+ "cbar-launch-service",
  "libc",
  "serde_json",
  "sha2",
@@ -1920,8 +1920,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "ironbar"
-version = "0.19.0"
+name = "cbar"
+version = "0.1.0"
 dependencies = [
  "bluer",
  "cbar-launcher",
@@ -1940,7 +1940,7 @@ dependencies = [
  "gtk4-layer-shell",
  "hyprland",
  "indexmap",
- "ironbar-launch-service",
+ "cbar-launch-service",
  "libpulse-binding",
  "lua-src",
  "mlua",
@@ -1970,7 +1970,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ironbar-launch-service"
+name = "cbar-launch-service"
 version = "0.1.0"
 dependencies = [
  "futures-channel",

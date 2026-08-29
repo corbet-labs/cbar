@@ -47,7 +47,7 @@ named-key and sleep options (`-P`, `-p`, and `-s`). Pass an exact compositor arg
 argument equal to `{config}` is replaced with the generated Sway-compatible fixture config:
 
 ```sh
-checks/headless-session.sh target/debug/ironbar wtype -- scroll -c '{config}'
+checks/headless-session.sh target/debug/cbar wtype -- scroll -c '{config}'
 ```
 
 All launcher inventory, configuration, mutable state, caches, IPC, D-Bus, and Wayland sockets live

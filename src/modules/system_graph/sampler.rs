@@ -1556,7 +1556,7 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let root = env::temp_dir().join(format!(
-                "ironbar-system-graph-{}-{}",
+                "cbar-system-graph-{}-{}",
                 std::process::id(),
                 NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
             ));

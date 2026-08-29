@@ -9,13 +9,13 @@
 # Usage:
 #   checks/headless-session.sh <cbar> <wtype-compatible-input-driver> -- <compositor> [arguments...]
 # Example:
-#   checks/headless-session.sh target/debug/ironbar wtype -- scroll -c '{config}'
+#   checks/headless-session.sh target/debug/cbar wtype -- scroll -c '{config}'
 set -euo pipefail
 
 usage() {
     printf '%s\n' \
         "usage: $0 <cbar> <input-driver> -- <compositor> [arguments...]" \
-        "example: $0 target/debug/ironbar wtype -- scroll -c '{config}'" >&2
+        "example: $0 target/debug/cbar wtype -- scroll -c '{config}'" >&2
     exit 2
 }
 
@@ -314,6 +314,36 @@ done
 [[ -n $wayland_display ]] || fail "compositor never created a Wayland socket"
 export WAYLAND_DISPLAY=$wayland_display
 
+# Connect the compositor adapter to the real isolated IPC socket. Scroll and
+# Sway intentionally keep distinct environment names; accepting both here
+# proves cbar does not need a schema-rewriting proxy.
+compositor_socket=
+compositor_socket_kind=
+for _ in $(seq 1 150); do
+    for socket in "$rig"/scroll-ipc.*.sock; do
+        if [[ -S $socket ]]; then
+            compositor_socket=$socket
+            compositor_socket_kind=scroll
+            break 2
+        fi
+    done
+    for socket in "$rig"/sway-ipc.*.sock; do
+        if [[ -S $socket ]]; then
+            compositor_socket=$socket
+            compositor_socket_kind=sway
+            break 2
+        fi
+    done
+    process_group_alive "$compositor_pid" || fail "compositor exited before creating its IPC socket"
+    sleep 0.1
+done
+[[ -n $compositor_socket ]] || fail "compositor never created an IPC socket"
+if [[ $compositor_socket_kind == scroll ]]; then
+    export SCROLLSOCK=$compositor_socket
+else
+    export SWAYSOCK=$compositor_socket
+fi
+
 # A headless seat starts without a physical keyboard. Keep one neutral virtual keyboard object
 # alive for the session so the compositor establishes keyboard focus before the layer surface maps;
 # a one-shot injector created only after map can disappear before that seat transition is applied.
@@ -329,8 +359,8 @@ CBAR_LAUNCHER_TRACE=1 \
 CBAR_GRAPH_TRACE=1 \
 CBAR_LAUNCHER_CONFIG="$rig/launcher.json" \
 CBAR_LAUNCHER_CACHE="$rig/cache/cbar/launcher/inventory" \
-IRONBAR_CONFIG="$rig/bar.toml" \
-IRONBAR_CSS="$rig/bar.css" \
+CBAR_CONFIG="$rig/bar.toml" \
+CBAR_CSS="$rig/bar.css" \
 setsid -- "$cbar" >"$rig/cbar.log" 2>&1 &
 bar_pid=$!
 assert_session_leader "$bar_pid" "cbar"
@@ -339,7 +369,7 @@ ipc_ready=false
 layout_ready=false
 startup_mapped_ns=
 for _ in $(seq 1 1500); do
-    [[ -S $rig/ironbar-ipc.sock ]] && ipc_ready=true
+    [[ -S $rig/cbar-ipc.sock ]] && ipc_ready=true
     if ! $layout_ready && grep -q 'cbar-layout-trace ' "$rig/cbar.log" 2>/dev/null; then
         startup_mapped_ns=$(date +%s%N)
         layout_ready=true
@@ -605,7 +635,7 @@ stop_process_group "$bar_pid" || fail "could not stop primary cbar fixture"
 bar_pid=
 for upstream_fixture in minimal desktop; do
     fixture_log="$rig/upstream-$upstream_fixture.log"
-    rm -f -- "$rig/ironbar-ipc.sock"
+    rm -f -- "$rig/cbar-ipc.sock"
     CBAR_LAYOUT_TRACE=1 \
     CBAR_LAUNCHER_CONFIG="$rig/launcher.json" \
     CBAR_LAUNCHER_CACHE="$rig/cache/cbar/launcher/inventory" \

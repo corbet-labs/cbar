@@ -179,7 +179,7 @@ impl GraphHub {
 
         let hub = self.clone();
         if let Err(err) = thread::Builder::new()
-            .name("ironbar-system-graph".to_string())
+            .name("cbar-system-graph".to_string())
             .spawn(move || hub.run())
         {
             // The graph module is optional UI. Resource exhaustion must not

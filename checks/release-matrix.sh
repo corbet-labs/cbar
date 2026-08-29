@@ -132,13 +132,13 @@ cargo package --manifest-path launcher-core/Cargo.toml --locked
 step package-launcher-gtk
 cargo package --manifest-path launcher-gtk/Cargo.toml --locked \
     --config "patch.crates-io.cbar-launcher-core.path='$repo/launcher-core'" \
-    --config "patch.crates-io.ironbar-launch-service.path='$repo/launch-service'"
+    --config "patch.crates-io.cbar-launch-service.path='$repo/launch-service'"
 
 step package-root
 cargo package --locked \
     --config "patch.crates-io.cbar-launcher.path='$repo/launcher-gtk'" \
     --config "patch.crates-io.cbar-launcher-core.path='$repo/launcher-core'" \
-    --config "patch.crates-io.ironbar-launch-service.path='$repo/launch-service'"
+    --config "patch.crates-io.cbar-launch-service.path='$repo/launch-service'"
 
 if command -v nix >/dev/null 2>&1; then
     step nix-flake-check
@@ -154,7 +154,7 @@ if $source_only; then
 fi
 
 step build-release-layer-binary
-cargo build --release --all-features --locked --bin ironbar
+cargo build --release --all-features --locked --bin cbar
 
 target_dir=${CARGO_TARGET_DIR:-$repo/target}
 if [[ $target_dir != /* ]]; then
@@ -164,7 +164,7 @@ fi
 step validate-upstream-config-formats
 for fixture in minimal desktop; do
     for format in corn json toml yaml; do
-        "$target_dir/release/ironbar" --validate-config \
+        "$target_dir/release/cbar" --validate-config \
             --config "$repo/examples/$fixture/config.$format"
     done
 done
@@ -176,7 +176,7 @@ fi
 
 step real-layer-headless
 PERF_OUT="$performance_out" \
-    checks/headless-session.sh "$target_dir/release/ironbar" "$input_driver" -- "${compositor[@]}"
+    checks/headless-session.sh "$target_dir/release/cbar" "$input_driver" -- "${compositor[@]}"
 
 if [[ -n ${PERF_BASELINE:-} ]]; then
     step performance-regression
