@@ -13,6 +13,16 @@ The caller may set `CARGO_TARGET_DIR`; build orchestration should put it on a
 filesystem with enough capacity rather than relying on a small temporary
 filesystem.
 
+The real-compositor gate builds the release binary, validates the upstream
+minimal and desktop fixtures in every supported configuration format, renders
+both built-in fixtures, and records startup-to-map latency, resident RSS, idle
+CPU time, graph samples, and graph redraws in
+`$CARGO_TARGET_DIR/cbar-performance-current.json`. Set `PERF_OUT` to choose a
+different artifact path. Once a previous release record exists, pass it as
+`PERF_BASELINE`; `compare-performance.py` then rejects material regressions
+while allowing bounded scheduler and allocator noise. The first release record
+is the baseline, not a fabricated comparison target.
+
 `headless-session.sh` starts cbar inside a private, headless Wayland session. It proves two
 layer-surface contracts that unit tests cannot observe:
 
@@ -22,7 +32,8 @@ layer-surface contracts that unit tests cannot observe:
 
 The launcher assertion uses its opt-in progress trace plus the ordinary IPC status command. The
 layout assertion uses `CBAR_LAYOUT_TRACE=1` to read GTK's final widget allocations, avoiding a
-font- and theme-sensitive screenshot comparison. Neither trace is active in an ordinary session.
+font- and theme-sensitive screenshot comparison. An opt-in graph trace counts sampler and Cairo
+work during an IPC-free idle window. None of these traces is active in an ordinary session.
 
 The harness does not install or pin a compositor. Its input-driver argument must implement wtype's
 named-key and sleep options (`-P`, `-p`, and `-s`). Pass an exact compositor argv after `--`; an

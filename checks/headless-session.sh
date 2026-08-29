@@ -43,7 +43,7 @@ command_exists "${COMPOSITOR_ARGV[0]}" || {
     printf 'no compositor: %s\n' "${COMPOSITOR_ARGV[0]}" >&2
     exit 2
 }
-for dependency in bash dbus-run-session ps python3 setsid; do
+for dependency in bash date dbus-run-session ps python3 setsid; do
     command_exists "$dependency" || { printf 'missing dependency: %s\n' "$dependency" >&2; exit 2; }
 done
 
@@ -322,8 +322,10 @@ assert_session_leader "$input_keeper_pid" "input keeper"
 sleep 0.1
 process_group_alive "$input_keeper_pid" || fail "input driver could not keep a virtual keyboard alive"
 
+startup_started_ns=$(date +%s%N)
 CBAR_LAYOUT_TRACE=1 \
 CBAR_LAUNCHER_TRACE=1 \
+CBAR_GRAPH_TRACE=1 \
 CBAR_LAUNCHER_CONFIG="$rig/launcher.json" \
 CBAR_LAUNCHER_CACHE="$rig/cache/cbar/launcher/inventory" \
 IRONBAR_CONFIG="$rig/bar.toml" \
@@ -338,6 +340,16 @@ for _ in $(seq 1 150); do
     sleep 0.1
 done
 [[ -S $rig/ironbar-ipc.sock ]] || fail "cbar never created its IPC socket"
+
+for _ in $(seq 1 100); do
+    grep -q 'cbar-layout-trace ' "$rig/cbar.log" 2>/dev/null && break
+    process_group_alive "$bar_pid" || fail "cbar exited before mapping its bar surface"
+    sleep 0.05
+done
+grep -q 'cbar-layout-trace ' "$rig/cbar.log" 2>/dev/null ||
+    fail "cbar never mapped its bar surface"
+startup_mapped_ns=$(date +%s%N)
+startup_to_layout_ms=$(((startup_mapped_ns - startup_started_ns) / 1000000))
 
 launcher_status() {
     "$cbar" launcher status 2>/dev/null
@@ -370,6 +382,31 @@ count_cancel_keys() {
 
 count_layer_shell_selections() {
     grep -c 'cbar-launcher-trace surface=layer-shell ' "$rig/cbar.log" 2>/dev/null || true
+}
+
+count_graph_samples() {
+    grep -c 'cbar-system-graph-trace sample$' "$rig/cbar.log" 2>/dev/null || true
+}
+
+count_graph_redraws() {
+    grep -c 'cbar-system-graph-trace redraw$' "$rig/cbar.log" 2>/dev/null || true
+}
+
+process_metrics() {
+    python3 - "$bar_pid" <<'PY'
+import os
+import pathlib
+import sys
+
+pid = int(sys.argv[1])
+stat = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+# The command name is parenthesised and may contain spaces. Fields after the final
+# closing parenthesis begin at field 3 (`state`).
+fields = stat[stat.rfind(")") + 2 :].split()
+cpu_ticks = int(fields[11]) + int(fields[12])
+resident_pages = int(fields[21])
+print(cpu_ticks, os.sysconf("SC_CLK_TCK"), resident_pages * os.sysconf("SC_PAGE_SIZE") // 1024)
+PY
 }
 
 wait_for_counter_above() {
@@ -456,8 +493,76 @@ wait_for_counter_above count_launcher_maps "$explicit_maps_before" "second launc
 "$cbar" launcher hide >/dev/null
 wait_for_status resident "explicit hide"
 
+# Measure a genuinely idle resident window. Do not poll cbar's IPC here: the measurement itself
+# must not manufacture control-socket work. Process liveness checks are kernel-only.
+idle_window_ms=2000
+read -r idle_ticks_before clock_ticks _ < <(process_metrics)
+graph_samples_before=$(count_graph_samples)
+graph_redraws_before=$(count_graph_redraws)
+for _ in $(seq 1 40); do
+    sleep 0.05
+    process_group_alive "$bar_pid" || fail "cbar exited during the performance window"
+done
+read -r idle_ticks_after clock_ticks_after resident_rss_kib < <(process_metrics)
+[[ $clock_ticks == "$clock_ticks_after" ]] || fail "process clock tick rate changed"
+idle_cpu_ms=$(((idle_ticks_after - idle_ticks_before) * 1000 / clock_ticks))
+graph_samples=$(( $(count_graph_samples) - graph_samples_before ))
+graph_redraws=$(( $(count_graph_redraws) - graph_redraws_before ))
+
+python3 - "$rig/performance.json" \
+    "$startup_to_layout_ms" "$resident_rss_kib" "$idle_window_ms" "$idle_cpu_ms" \
+    "$graph_samples" "$graph_redraws" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+metrics = {
+    "startup_to_layout_ms": int(sys.argv[2]),
+    "resident_rss_kib": int(sys.argv[3]),
+    "idle_window_ms": int(sys.argv[4]),
+    "idle_cpu_ms": int(sys.argv[5]),
+    "graph_samples": int(sys.argv[6]),
+    "graph_redraws": int(sys.argv[7]),
+}
+path.write_text(
+    json.dumps({"schema": 1, "metrics": metrics}, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+
+printf 'performance startup_to_layout_ms=%s resident_rss_kib=%s idle_window_ms=%s idle_cpu_ms=%s graph_samples=%s graph_redraws=%s\n' \
+    "$startup_to_layout_ms" "$resident_rss_kib" "$idle_window_ms" "$idle_cpu_ms" \
+    "$graph_samples" "$graph_redraws"
+
 printf 'launcher first_maps=%s final_maps=%s final_status=%s\n' \
     "$first_maps" "$(count_launcher_maps)" "$(launcher_status)"
+
+# The built-in minimal and desktop configurations are the fork's verbatim upstream compatibility
+# fixtures. Map both against the same private compositor so the gate proves more than deserialization.
+stop_process_group "$bar_pid" || fail "could not stop primary cbar fixture"
+bar_pid=
+for upstream_fixture in minimal desktop; do
+    fixture_log="$rig/upstream-$upstream_fixture.log"
+    rm -f -- "$rig/ironbar-ipc.sock"
+    CBAR_LAYOUT_TRACE=1 \
+    CBAR_LAUNCHER_CONFIG="$rig/launcher.json" \
+    CBAR_LAUNCHER_CACHE="$rig/cache/cbar/launcher/inventory" \
+    setsid -- "$cbar" --config "$upstream_fixture" >"$fixture_log" 2>&1 &
+    bar_pid=$!
+    assert_session_leader "$bar_pid" "upstream $upstream_fixture fixture"
+    for _ in $(seq 1 200); do
+        grep -q 'cbar-layout-trace ' "$fixture_log" 2>/dev/null && break
+        process_group_alive "$bar_pid" ||
+            fail "upstream $upstream_fixture fixture exited before map"
+        sleep 0.05
+    done
+    grep -q 'cbar-layout-trace ' "$fixture_log" 2>/dev/null ||
+        fail "upstream $upstream_fixture fixture did not map"
+    printf 'upstream fixture=%s render=PASS\n' "$upstream_fixture"
+    stop_process_group "$bar_pid" || fail "could not stop upstream $upstream_fixture fixture"
+    bar_pid=
+done
 SESSION
 then
     printf 'headless session failed\n' >&2
@@ -537,6 +642,10 @@ print("headless cbar session OK")
 PY
 
 cat "$RIG/session.log"
+if [[ -n ${PERF_OUT:-} ]]; then
+    mkdir -p -- "$(dirname -- "$PERF_OUT")"
+    cp -- "$RIG/performance.json" "$PERF_OUT"
+fi
 if [[ -n ${TRACE_OUT:-} ]]; then
     cp -- "$RIG/cbar.log" "$TRACE_OUT"
 fi

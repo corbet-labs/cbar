@@ -34,6 +34,9 @@ step() {
 step format
 cargo fmt --all -- --check
 
+step performance-comparator-self-test
+python3 checks/compare-performance.py --self-test
+
 step check-all-targets-features
 cargo check --workspace --all-targets --all-features --locked
 
@@ -92,15 +95,36 @@ if $source_only; then
     exit 0
 fi
 
-step build-real-layer-binary
-cargo build --all-features --locked --bin ironbar
+step build-release-layer-binary
+cargo build --release --all-features --locked --bin ironbar
 
 target_dir=${CARGO_TARGET_DIR:-$repo/target}
 if [[ $target_dir != /* ]]; then
     target_dir=$repo/$target_dir
 fi
 
+step validate-upstream-config-formats
+for fixture in minimal desktop; do
+    for format in corn json toml yaml; do
+        "$target_dir/release/ironbar" --validate-config \
+            --config "$repo/examples/$fixture/config.$format"
+    done
+done
+
+performance_out=${PERF_OUT:-$target_dir/cbar-performance-current.json}
+if [[ $performance_out != /* ]]; then
+    performance_out=$repo/$performance_out
+fi
+
 step real-layer-headless
-checks/headless-session.sh "$target_dir/debug/ironbar" "$input_driver" -- "${compositor[@]}"
+PERF_OUT="$performance_out" \
+    checks/headless-session.sh "$target_dir/release/ironbar" "$input_driver" -- "${compositor[@]}"
+
+if [[ -n ${PERF_BASELINE:-} ]]; then
+    step performance-regression
+    python3 checks/compare-performance.py "$PERF_BASELINE" "$performance_out"
+fi
+
+printf 'performance-record=%s\n' "$performance_out"
 
 printf 'release-matrix=PASS\n'
