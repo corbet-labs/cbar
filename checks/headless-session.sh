@@ -515,8 +515,11 @@ idle_window_ms=$(((idle_finished_ns - idle_started_ns) / 1000000))
 idle_cpu_ms=$(((idle_ticks_after - idle_ticks_before) * 1000 / clock_ticks))
 graph_samples=$(( $(count_graph_samples) - graph_samples_before ))
 graph_redraws=$(( $(count_graph_redraws) - graph_redraws_before ))
-(( graph_samples >= 11 )) ||
-    fail "graph sampler did not maintain its 500ms cadence during the idle window"
+graph_expected_samples=$(((idle_window_ms + 250) / 500))
+graph_min_samples=$((graph_expected_samples > 0 ? graph_expected_samples - 1 : 0))
+graph_max_samples=$((graph_expected_samples + 1))
+(( graph_samples >= graph_min_samples && graph_samples <= graph_max_samples )) ||
+    fail "graph sampler cadence drifted: observed $graph_samples samples in ${idle_window_ms}ms; expected $graph_expected_samples +/- 1 at 500ms"
 (( graph_redraws >= 1 )) || fail "mapped graph received samples but never redrew"
 (( graph_redraws <= graph_samples + 1 )) ||
     fail "graph redrew more often than new samples required"
