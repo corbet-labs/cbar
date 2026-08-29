@@ -139,6 +139,11 @@ in
         --bash target/completions/ironbar.bash \
         --fish target/completions/ironbar.fish \
         --zsh target/completions/_ironbar
+
+      install -Dm644 LICENSE "$out/share/licenses/ironbar/LICENSE"
+      install -Dm644 launcher-core/LICENSE \
+        "$out/share/licenses/ironbar/LICENSE.nixlaunch"
+      install -Dm644 NOTICE "$out/share/doc/ironbar/NOTICE"
     '';
 
     passthru = {
