@@ -26,6 +26,8 @@ fingerprint of the CPU, kernel, architecture, compositor argv, output, fixed
 GTK/Cairo and compositor/pixman renderers, and sampling setup; mismatched
 environments are not presented as comparable. The first release record is the
 baseline, not a fabricated comparison target.
+The gate also prints the complete small JSON record, so CI logs retain the
+evidence even when no artifact publisher is configured.
 
 `headless-session.sh` starts cbar inside a private, headless Wayland session. It proves two
 layer-surface contracts that unit tests cannot observe:

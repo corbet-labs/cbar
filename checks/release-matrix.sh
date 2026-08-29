@@ -184,5 +184,6 @@ if [[ -n ${PERF_BASELINE:-} ]]; then
 fi
 
 printf 'performance-record=%s\n' "$performance_out"
+cat -- "$performance_out"
 
 printf 'release-matrix=PASS\n'
