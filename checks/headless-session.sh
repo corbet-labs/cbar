@@ -505,7 +505,7 @@ wait_for_status resident "explicit hide"
 read -r idle_ticks_before clock_ticks _ idle_started_ns < <(process_metrics)
 graph_samples_before=$(count_graph_samples)
 graph_redraws_before=$(count_graph_redraws)
-for _ in $(seq 1 40); do
+for _ in $(seq 1 120); do
     sleep 0.05
     process_group_alive "$bar_pid" || fail "cbar exited during the performance window"
 done
@@ -515,7 +515,7 @@ idle_window_ms=$(((idle_finished_ns - idle_started_ns) / 1000000))
 idle_cpu_ms=$(((idle_ticks_after - idle_ticks_before) * 1000 / clock_ticks))
 graph_samples=$(( $(count_graph_samples) - graph_samples_before ))
 graph_redraws=$(( $(count_graph_redraws) - graph_redraws_before ))
-(( graph_samples >= 3 )) ||
+(( graph_samples >= 11 )) ||
     fail "graph sampler did not maintain its 500ms cadence during the idle window"
 (( graph_redraws >= 1 )) || fail "mapped graph received samples but never redrew"
 (( graph_redraws <= graph_samples + 1 )) ||
@@ -570,6 +570,7 @@ context = {
     "gdk_backend": "wayland",
     "graph_sample_interval_ms": 500,
     "gtk_renderer": "cairo",
+    "idle_target_ms": 6000,
     "kernel_release": os.uname().release,
     "logical_cpus": os.cpu_count(),
     "output_mode": "1920x1080",

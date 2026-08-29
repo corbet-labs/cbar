@@ -25,7 +25,7 @@ LIMITS = {
     "idle_cpu_ms_per_s": Limit(relative=0.25, absolute=10.0),
     "graph_redraws_per_s": Limit(relative=0.20, absolute=0.5),
 }
-SAMPLE_RATE_LIMIT = Limit(relative=0.20, absolute=0.5)
+SAMPLE_RATE_LIMIT = Limit(relative=0.10, absolute=0.2)
 
 
 def load(path: pathlib.Path) -> dict[str, Any]:

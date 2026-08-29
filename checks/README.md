@@ -39,7 +39,8 @@ layer-surface contracts that unit tests cannot observe:
 The launcher assertion uses its opt-in progress trace plus the ordinary IPC status command. The
 layout assertion uses `CBAR_LAYOUT_TRACE=1` to read GTK's final widget allocations, avoiding a
 font- and theme-sensitive screenshot comparison. An opt-in graph trace counts sampler and Cairo
-work during an IPC-free idle window. None of these traces is active in an ordinary session.
+work during a six-second IPC-free idle window, long enough to include the five-second capability
+cadence. None of these traces is active in an ordinary session.
 
 The harness does not install or pin a compositor. Its input-driver argument must implement wtype's
 named-key and sleep options (`-P`, `-p`, and `-s`). Pass an exact compositor argv after `--`; an
