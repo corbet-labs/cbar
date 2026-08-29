@@ -1,6 +1,7 @@
 [package]
 name = "cbar-launcher"
 version = "0.1.0"
+publish = false
 edition = "2024"
 license = "MIT"
 description = "Resident GTK4 matrix launcher integrated into cbar"

@@ -14,7 +14,9 @@ gates documented in `docs/Cbar architecture.md` before it is published.
 
 Repository, package, application, and release identities are intentionally
 separate from upstream ownership. The final public identity is not assigned in
-this working tree yet.
+this working tree yet. Every Cargo package therefore has `publish = false`;
+publication is enabled only after the final package names, repository metadata,
+and release ownership are assigned together.
 
 ## Synchronising upstream
 
