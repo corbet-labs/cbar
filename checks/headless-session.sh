@@ -334,21 +334,21 @@ setsid -- "$cbar" >"$rig/cbar.log" 2>&1 &
 bar_pid=$!
 assert_session_leader "$bar_pid" "cbar"
 
-for _ in $(seq 1 150); do
-    [[ -S $rig/ironbar-ipc.sock ]] && break
-    process_group_alive "$bar_pid" || fail "cbar exited before creating its IPC socket"
-    sleep 0.1
+ipc_ready=false
+layout_ready=false
+startup_mapped_ns=
+for _ in $(seq 1 1500); do
+    [[ -S $rig/ironbar-ipc.sock ]] && ipc_ready=true
+    if ! $layout_ready && grep -q 'cbar-layout-trace ' "$rig/cbar.log" 2>/dev/null; then
+        startup_mapped_ns=$(date +%s%N)
+        layout_ready=true
+    fi
+    $ipc_ready && $layout_ready && break
+    process_group_alive "$bar_pid" || fail "cbar exited before its bar and IPC socket were ready"
+    sleep 0.01
 done
-[[ -S $rig/ironbar-ipc.sock ]] || fail "cbar never created its IPC socket"
-
-for _ in $(seq 1 100); do
-    grep -q 'cbar-layout-trace ' "$rig/cbar.log" 2>/dev/null && break
-    process_group_alive "$bar_pid" || fail "cbar exited before mapping its bar surface"
-    sleep 0.05
-done
-grep -q 'cbar-layout-trace ' "$rig/cbar.log" 2>/dev/null ||
-    fail "cbar never mapped its bar surface"
-startup_mapped_ns=$(date +%s%N)
+$ipc_ready || fail "cbar never created its IPC socket"
+$layout_ready || fail "cbar never mapped its bar surface"
 startup_to_layout_ms=$(((startup_mapped_ns - startup_started_ns) / 1000000))
 
 launcher_status() {
@@ -385,11 +385,11 @@ count_layer_shell_selections() {
 }
 
 count_graph_samples() {
-    grep -c 'cbar-system-graph-trace sample$' "$rig/cbar.log" 2>/dev/null || true
+    grep -c 'cbar-graph-trace event=sample ' "$rig/cbar.log" 2>/dev/null || true
 }
 
 count_graph_redraws() {
-    grep -c 'cbar-system-graph-trace redraw$' "$rig/cbar.log" 2>/dev/null || true
+    grep -c 'cbar-graph-trace event=redraw ' "$rig/cbar.log" 2>/dev/null || true
 }
 
 process_metrics() {
@@ -397,6 +397,7 @@ process_metrics() {
 import os
 import pathlib
 import sys
+import time
 
 pid = int(sys.argv[1])
 stat = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
@@ -405,7 +406,12 @@ stat = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
 fields = stat[stat.rfind(")") + 2 :].split()
 cpu_ticks = int(fields[11]) + int(fields[12])
 resident_pages = int(fields[21])
-print(cpu_ticks, os.sysconf("SC_CLK_TCK"), resident_pages * os.sysconf("SC_PAGE_SIZE") // 1024)
+print(
+    cpu_ticks,
+    os.sysconf("SC_CLK_TCK"),
+    resident_pages * os.sysconf("SC_PAGE_SIZE") // 1024,
+    time.monotonic_ns(),
+)
 PY
 }
 
@@ -495,25 +501,33 @@ wait_for_status resident "explicit hide"
 
 # Measure a genuinely idle resident window. Do not poll cbar's IPC here: the measurement itself
 # must not manufacture control-socket work. Process liveness checks are kernel-only.
-idle_window_ms=2000
-read -r idle_ticks_before clock_ticks _ < <(process_metrics)
+read -r idle_ticks_before clock_ticks _ idle_started_ns < <(process_metrics)
 graph_samples_before=$(count_graph_samples)
 graph_redraws_before=$(count_graph_redraws)
 for _ in $(seq 1 40); do
     sleep 0.05
     process_group_alive "$bar_pid" || fail "cbar exited during the performance window"
 done
-read -r idle_ticks_after clock_ticks_after resident_rss_kib < <(process_metrics)
+read -r idle_ticks_after clock_ticks_after resident_rss_kib idle_finished_ns < <(process_metrics)
 [[ $clock_ticks == "$clock_ticks_after" ]] || fail "process clock tick rate changed"
+idle_window_ms=$(((idle_finished_ns - idle_started_ns) / 1000000))
 idle_cpu_ms=$(((idle_ticks_after - idle_ticks_before) * 1000 / clock_ticks))
 graph_samples=$(( $(count_graph_samples) - graph_samples_before ))
 graph_redraws=$(( $(count_graph_redraws) - graph_redraws_before ))
+(( graph_samples >= 3 )) ||
+    fail "graph sampler did not maintain its 500ms cadence during the idle window"
+(( graph_redraws >= 1 )) || fail "mapped graph received samples but never redrew"
+(( graph_redraws <= graph_samples + 1 )) ||
+    fail "graph redrew more often than new samples required"
 
 python3 - "$rig/performance.json" \
     "$startup_to_layout_ms" "$resident_rss_kib" "$idle_window_ms" "$idle_cpu_ms" \
-    "$graph_samples" "$graph_redraws" <<'PY'
+    "$graph_samples" "$graph_redraws" "${compositor[0]}" "$cbar" "$clock_ticks" <<'PY'
+import hashlib
 import json
+import os
 import pathlib
+import shutil
 import sys
 
 path = pathlib.Path(sys.argv[1])
@@ -525,8 +539,42 @@ metrics = {
     "graph_samples": int(sys.argv[6]),
     "graph_redraws": int(sys.argv[7]),
 }
+compositor = shutil.which(sys.argv[8]) or sys.argv[8]
+binary = shutil.which(sys.argv[9]) or sys.argv[9]
+cpu_model = "unknown"
+try:
+    for line in pathlib.Path("/proc/cpuinfo").read_text(
+        encoding="utf-8", errors="replace"
+    ).splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip() in {"model name", "Hardware", "Processor"}:
+            cpu_model = value.strip()
+            break
+except OSError:
+    pass
+context = {
+    "architecture": os.uname().machine,
+    "binary_profile": pathlib.Path(os.path.realpath(binary)).parent.name,
+    "clock_ticks": int(sys.argv[10]),
+    "compositor_executable": os.path.realpath(compositor),
+    "cpu_model": cpu_model,
+    "gdk_backend": "wayland",
+    "graph_sample_interval_ms": 500,
+    "kernel_release": os.uname().release,
+    "logical_cpus": os.cpu_count(),
+    "output_mode": "1920x1080",
+    "page_size": os.sysconf("SC_PAGE_SIZE"),
+    "renderer": "pixman",
+}
+encoded_context = json.dumps(context, sort_keys=True, separators=(",", ":")).encode()
+record = {
+    "schema": 1,
+    "context": context,
+    "context_fingerprint": hashlib.sha256(encoded_context).hexdigest(),
+    "metrics": metrics,
+}
 path.write_text(
-    json.dumps({"schema": 1, "metrics": metrics}, indent=2, sort_keys=True) + "\n",
+    json.dumps(record, indent=2, sort_keys=True) + "\n",
     encoding="utf-8",
 )
 PY

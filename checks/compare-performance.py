@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import pathlib
@@ -24,6 +25,7 @@ LIMITS = {
     "idle_cpu_ms_per_s": Limit(relative=0.25, absolute=10.0),
     "graph_redraws_per_s": Limit(relative=0.20, absolute=0.5),
 }
+SAMPLE_RATE_LIMIT = Limit(relative=0.20, absolute=0.5)
 
 
 def load(path: pathlib.Path) -> dict[str, Any]:
@@ -31,9 +33,22 @@ def load(path: pathlib.Path) -> dict[str, Any]:
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"cannot read {path}: {error}") from error
-    if record.get("schema") != 1 or not isinstance(record.get("metrics"), dict):
+    if (
+        record.get("schema") != 1
+        or not isinstance(record.get("metrics"), dict)
+        or not isinstance(record.get("context"), dict)
+        or not isinstance(record.get("context_fingerprint"), str)
+    ):
         raise ValueError(f"{path}: expected performance schema 1")
+    expected = context_fingerprint(record["context"])
+    if record["context_fingerprint"] != expected:
+        raise ValueError(f"{path}: benchmark context fingerprint is invalid")
     return record
+
+
+def context_fingerprint(context: dict[str, Any]) -> str:
+    encoded = json.dumps(context, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def number(metrics: dict[str, Any], name: str) -> float:
@@ -64,6 +79,10 @@ def normalized(record: dict[str, Any]) -> dict[str, float]:
 def compare(
     baseline: dict[str, Any], current: dict[str, Any], *, emit: bool = True
 ) -> list[str]:
+    if baseline.get("context_fingerprint") != current.get("context_fingerprint"):
+        raise ValueError(
+            "benchmark contexts differ; record a new baseline before comparing releases"
+        )
     old = normalized(baseline)
     new = normalized(current)
     failures = []
@@ -79,18 +98,34 @@ def compare(
         if result != "PASS":
             failures.append(name)
 
+    sample_allowance = max(
+        old["graph_samples_per_s"] * SAMPLE_RATE_LIMIT.relative,
+        SAMPLE_RATE_LIMIT.absolute,
+    )
+    sample_delta = abs(new["graph_samples_per_s"] - old["graph_samples_per_s"])
+    sample_result = "PASS" if sample_delta <= sample_allowance else "REGRESSION"
     if emit:
         print(
             "performance-compare "
             f"metric=graph_samples_per_s baseline={old['graph_samples_per_s']:.3f} "
-            f"current={new['graph_samples_per_s']:.3f} result=RECORDED"
+            f"current={new['graph_samples_per_s']:.3f} "
+            f"allowance={sample_allowance:.3f} result={sample_result}"
         )
+    if sample_result != "PASS":
+        failures.append("graph_samples_per_s")
     return failures
 
 
 def self_test() -> None:
+    context = {
+        "architecture": "fixture",
+        "binary_profile": "release",
+        "graph_sample_interval_ms": 500,
+    }
     baseline = {
         "schema": 1,
+        "context": context,
+        "context_fingerprint": context_fingerprint(context),
         "metrics": {
             "startup_to_layout_ms": 100,
             "resident_rss_kib": 50_000,
@@ -107,6 +142,21 @@ def self_test() -> None:
     regression = json.loads(json.dumps(baseline))
     regression["metrics"]["resident_rss_kib"] += 5_001
     assert compare(baseline, regression, emit=False) == ["resident_rss_kib"]
+
+    slow_sampler = json.loads(json.dumps(baseline))
+    slow_sampler["metrics"]["graph_samples"] = 2
+    assert compare(baseline, slow_sampler, emit=False) == ["graph_samples_per_s"]
+
+    mismatched = json.loads(json.dumps(baseline))
+    mismatched_context = {**context, "architecture": "different"}
+    mismatched["context"] = mismatched_context
+    mismatched["context_fingerprint"] = context_fingerprint(mismatched_context)
+    try:
+        compare(baseline, mismatched, emit=False)
+    except ValueError as error:
+        assert "contexts differ" in str(error)
+    else:
+        raise AssertionError("mismatched benchmark contexts must not compare")
     print("performance-compare self-test=PASS")
 
 
